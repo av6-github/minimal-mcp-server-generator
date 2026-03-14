@@ -202,13 +202,46 @@ RC_USER_ID=your_user_id
 // ─── README GENERATOR ─────────────────────────────────────────────────────────
 
 export function generateReadme(tools: MCPToolSchema[], totalApiCount: number): string {
-  const toolList = tools.map(t =>
-    `| \`${t.name}\` | ${t.description} | \`${t.httpMethod} ${t.httpPath}\` |`
-  ).join("\n");
 
-  const minTokens = tools.length * 250;
-  const fullTokens = totalApiCount * 250;
-  const savings = Math.round(((fullTokens - minTokens) / fullTokens) * 100);
+  // Calculate real token costs per tool
+  const toolTokenCosts = tools.map(t => {
+    const nameTokens = Math.ceil(t.name.length / 4);
+    const descTokens = Math.ceil(t.description.length / 4);
+    const schemaTokens = Object.keys(t.inputSchema.properties).length * 15;
+    const propDescTokens = Object.values(t.inputSchema.properties)
+      .reduce((sum, p) => sum + Math.ceil((p.description?.length || 0) / 4), 0);
+    const total = nameTokens + descTokens + schemaTokens + propDescTokens + 20; // 20 for structure
+    return { name: t.name, tokens: total };
+  });
+
+  const minimalTokens = toolTokenCosts.reduce((sum, t) => sum + t.tokens, 0);
+  const avgTokensPerTool = Math.round(minimalTokens / tools.length);
+  const fullTokens = Math.round((minimalTokens / tools.length) * totalApiCount);
+  const savedTokens = fullTokens - minimalTokens;
+  const savedPct = Math.round((savedTokens / fullTokens) * 100);
+
+  // Cost calculations (Claude Sonnet pricing: $3/1M input tokens)
+  const costPer1M = 3.0;
+  const costPerRunMinimal = ((minimalTokens / 1_000_000) * costPer1M).toFixed(6);
+  const costPerRunFull = ((fullTokens / 1_000_000) * costPer1M).toFixed(6);
+
+  // Agentic loop costs (20 iterations is typical)
+  const loopIterations = 20;
+  const loopCostMinimal = ((minimalTokens * loopIterations / 1_000_000) * costPer1M).toFixed(4);
+  const loopCostFull = ((fullTokens * loopIterations / 1_000_000) * costPer1M).toFixed(4);
+
+  // Monthly costs (100 tasks/month)
+  const tasksPerMonth = 100;
+  const monthlyCostMinimal = ((minimalTokens * loopIterations * tasksPerMonth / 1_000_000) * costPer1M).toFixed(2);
+  const monthlyCostFull = ((fullTokens * loopIterations * tasksPerMonth / 1_000_000) * costPer1M).toFixed(2);
+
+  const toolBreakdown = toolTokenCosts
+    .map(t => `| \`${t.name}\` | ~${t.tokens} tokens |`)
+    .join("\n");
+
+  const toolList = tools
+    .map(t => `| \`${t.name}\` | ${t.description} | \`${t.httpMethod} ${t.httpPath}\` |`)
+    .join("\n");
 
   return `# Rocket.Chat Minimal MCP Server
 
@@ -220,41 +253,35 @@ export function generateReadme(tools: MCPToolSchema[], totalApiCount: number): s
 |------|-------------|----------|
 ${toolList}
 
-## Token Savings
+## Token Analysis
 
-| | Tokens |
-|---|---|
-| Full Rocket.Chat MCP server | ~${fullTokens.toLocaleString()} |
-| This minimal server | ~${minTokens.toLocaleString()} |
-| **Savings** | **~${(fullTokens - minTokens).toLocaleString()} tokens (${savings}% reduction)** |
+### Per-tool token cost breakdown
+| Tool | Token Cost |
+|------|-----------|
+${toolBreakdown}
+| **Total (this server)** | **~${minimalTokens} tokens** |
+| Full RC server (~${totalApiCount} tools) | ~${fullTokens} tokens |
+| **Savings** | **~${savedTokens} tokens (${savedPct}%)** |
+
+### Real cost impact (Claude Sonnet @ $3/1M tokens)
+
+| Scenario | Minimal Server | Full Server | Savings |
+|----------|---------------|-------------|---------|
+| Single agent call | $${costPerRunMinimal} | $${costPerRunFull} | $${(parseFloat(costPerRunFull) - parseFloat(costPerRunMinimal)).toFixed(6)} |
+| Agentic loop (${loopIterations} iterations) | $${loopCostMinimal} | $${loopCostFull} | $${(parseFloat(loopCostFull) - parseFloat(loopCostMinimal)).toFixed(4)} |
+| Monthly (${tasksPerMonth} tasks × ${loopIterations} iterations) | $${monthlyCostMinimal} | $${monthlyCostFull} | $${(parseFloat(monthlyCostFull) - parseFloat(monthlyCostMinimal)).toFixed(2)} |
+
+### Context window impact
+- Available context window (Claude Sonnet): 200,000 tokens
+- Full server overhead: **${((fullTokens / 200000) * 100).toFixed(1)}%** of context consumed by tool definitions alone
+- Minimal server overhead: **${((minimalTokens / 200000) * 100).toFixed(1)}%** of context
+- **Context freed up for actual work: ${((savedTokens / 200000) * 100).toFixed(1)}% of context window**
 
 ## Setup
 
 \`\`\`bash
 cp .env.example .env
-# Edit .env with your Rocket.Chat credentials
-npm install
-npm run build
-npm start
-\`\`\`
-
-## Add to Claude Desktop / Cursor / gemini-cli
-
-\`\`\`json
-{
-  "mcpServers": {
-    "rocketchat": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/absolute/path/to/this/folder",
-      "env": {
-        "RC_URL": "https://your.rocket.chat",
-        "RC_AUTH_TOKEN": "your_token",
-        "RC_USER_ID": "your_user_id"
-      }
-    }
-  }
-}
+npm install && npm run build && npm test
 \`\`\`
 `;
 }

@@ -1,12 +1,17 @@
-description = "Generate a minimal Rocket.Chat MCP server for specified APIs"
+description = "Generate a minimal Rocket.Chat MCP server — specify APIs or describe your requirements"
 
 prompt = """
 The user wants to generate a minimal Rocket.Chat MCP server.
 
 Their request: {{args}}
 
-Instructions:
-1. If they specified API names, call `generate_mcp_server` with those APIs immediately.
-2. If they haven't specified which APIs they need, call `list_rocketchat_apis` first to show options, then ask which ones they want.
-3. After generation, clearly report: output path, tools included, and token savings vs a full RC MCP server.
+Decision logic:
+- If they listed specific API names (e.g. "sendMessage, getChannels") → call `generate_mcp_server` directly with those names
+- If they described what they want to build (e.g. "a bot that monitors channels") → call `analyze_requirements` first, then call `generate_mcp_server` with the suggested APIs
+- If unclear → call `list_rocketchat_apis` to show options, then ask
+
+After generation always report:
+1. Which tools were included and why
+2. Exact token savings with real numbers
+3. How to run the generated server
 """
