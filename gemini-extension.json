@@ -1,0 +1,34 @@
+{
+    "name": "rocketchat-mcp-generator",
+    "version": "1.0.0",
+    "contextFileName": "GEMINI.md",
+    "settings": [
+        {
+            "name": "Rocket.Chat URL",
+            "description": "The base URL of your Rocket.Chat instance",
+            "envVar": "RC_URL",
+            "sensitive": false
+        },
+        {
+            "name": "Auth Token",
+            "description": "Your Rocket.Chat personal access token",
+            "envVar": "RC_AUTH_TOKEN",
+            "sensitive": true
+        },
+        {
+            "name": "User ID",
+            "description": "Your Rocket.Chat user ID",
+            "envVar": "RC_USER_ID",
+            "sensitive": true
+        }
+    ],
+    "mcpServers": {
+        "rocketchat-generator": {
+            "command": "node",
+            "args": [
+                "${extensionPath}/dist/server.js"
+            ],
+            "cwd": "${extensionPath}"
+        }
+    }
+}

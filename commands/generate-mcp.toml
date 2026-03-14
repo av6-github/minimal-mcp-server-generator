@@ -1,0 +1,12 @@
+description = "Generate a minimal Rocket.Chat MCP server for specified APIs"
+
+prompt = """
+The user wants to generate a minimal Rocket.Chat MCP server.
+
+Their request: {{args}}
+
+Instructions:
+1. If they specified API names, call `generate_mcp_server` with those APIs immediately.
+2. If they haven't specified which APIs they need, call `list_rocketchat_apis` first to show options, then ask which ones they want.
+3. After generation, clearly report: output path, tools included, and token savings vs a full RC MCP server.
+"""
