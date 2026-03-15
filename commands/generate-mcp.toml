@@ -1,17 +1,29 @@
-description = "Generate a minimal Rocket.Chat MCP server — specify APIs or describe your requirements"
+description = "Generate a minimal Rocket.Chat MCP server"
 
 prompt = """
 The user wants to generate a minimal Rocket.Chat MCP server.
 
 Their request: {{args}}
 
-Decision logic:
-- If they listed specific API names (e.g. "sendMessage, getChannels") → call `generate_mcp_server` directly with those names
-- If they described what they want to build (e.g. "a bot that monitors channels") → call `analyze_requirements` first, then call `generate_mcp_server` with the suggested APIs
-- If unclear → call `list_rocketchat_apis` to show options, then ask
+STRICT FLOW — follow this exactly, do not skip or combine steps:
 
-After generation always report:
-1. Which tools were included and why
-2. Exact token savings with real numbers
-3. How to run the generated server
+STEP 1 — ANALYZE
+- If the user gave specific API names → call `propose_mcp_server` with those APIs and reasoning
+- If the user described a use case → call `analyze_requirements` first, then `propose_mcp_server`
+
+STEP 2 — WAIT FOR CONFIRMATION
+- After propose_mcp_server runs, STOP and wait for the user to respond
+- If user says "add X": update list and call propose_mcp_server again with full updated list
+- If user says "remove X": update list and call propose_mcp_server again with full updated list
+- Only proceed to STEP 3 when user confirms the list with "confirm", "yes", "looks good", or similar
+
+STEP 3 — ASK FOR NAME
+- Call `ask_server_name` with a suggested name derived from the use case
+- STOP and wait for the user to respond with a name
+- If user says "use suggested": use the suggested name
+- Otherwise use whatever name they typed
+
+STEP 4 — GENERATE
+- Call generate_mcp_server with the confirmed API list and the serverName from STEP 3
+- Report token savings table and next steps
 """

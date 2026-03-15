@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import yaml from "js-yaml";
@@ -7,16 +7,161 @@ import type { RCEndpoint, RCParameter } from "./types.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SPECS_DIR = join(__dirname, "../specs");
 
+const RC_OPENAPI_REPO = "https://raw.githubusercontent.com/RocketChat/Rocket.Chat-Open-API/main";
+
+const CACHE_DIR = join(__dirname, "../specs-cache");
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+const SPEC_FILES = [
+    "authentication.yaml",
+    "content-management.yaml",
+    "integrations.yaml",
+    "marketplace-apps.yaml",
+    "messaging.yaml",
+    "miscellaneous.yaml",
+    "notifications.yaml",
+    "omnichannel.yaml",
+    "rooms.yaml",
+    "settings.yaml",
+    "statistics.yaml",
+    "user-management.yaml",
+];
+
 // ─── LOAD AND PARSE ALL YAML SPEC FILES ──────────────────────────────────────
 
-function loadAllSpecs(): Record<string, any> {
+// ─── CACHE HELPERS ────────────────────────────────────────────────────────────
+
+function getCachePath(filename: string): string {
+    return join(CACHE_DIR, filename);
+}
+
+function isCacheValid(filename: string): boolean {
+    const cachePath = getCachePath(filename);
+    if (!existsSync(cachePath)) return false;
+    try {
+        const stats = require("fs").statSync(cachePath);
+        return (Date.now() - stats.mtimeMs) < CACHE_MAX_AGE_MS;
+    } catch {
+        return false;
+    }
+}
+
+function readFromCache(filename: string): string {
+    return readFileSync(getCachePath(filename), "utf-8");
+}
+
+function writeToCache(filename: string, content: string): void {
+    try {
+        mkdirSync(CACHE_DIR, { recursive: true });
+        writeFileSync(getCachePath(filename), content, "utf-8");
+    } catch {
+        // Cache write failure is non-fatal
+    }
+}
+
+// ─── GITHUB FETCHER ───────────────────────────────────────────────────────────
+
+async function fetchSpecFromGitHub(filename: string): Promise<string> {
+    const url = `${RC_OPENAPI_REPO}/${filename}`;
+
+    const headers: Record<string, string> = {
+        "Accept": "application/vnd.github.raw+json",
+        "User-Agent": "gemini-rocketchat-mcp-generator",
+    };
+
+    // Use PAT if provided — avoids rate limits (60 req/hr unauthenticated vs 5000/hr with PAT)
+    const pat = process.env.GITHUB_PAT || process.env.GITHUB_TOKEN;
+    if (pat) {
+        headers["Authorization"] = `Bearer ${pat}`;
+    }
+
+    const response = await fetch(url, { headers });
+
+    if (response.status === 403) {
+        const remaining = response.headers.get("x-ratelimit-remaining");
+        const reset = response.headers.get("x-ratelimit-reset");
+        const resetTime = reset
+            ? new Date(parseInt(reset) * 1000).toLocaleTimeString()
+            : "unknown";
+        throw new Error(
+            `GitHub rate limit hit. Remaining: ${remaining ?? "0"}. ` +
+            `Resets at: ${resetTime}. ` +
+            `Set GITHUB_PAT env var to avoid rate limits.`
+        );
+    }
+
+    if (response.status === 401) {
+        throw new Error("GitHub PAT is invalid or expired. Check your GITHUB_PAT env var.");
+    }
+
+    if (!response.ok) {
+        throw new Error(`GitHub fetch failed for ${filename}: HTTP ${response.status}`);
+    }
+
+    return response.text();
+}
+
+// ─── SPEC LOADER ──────────────────────────────────────────────────────────────
+
+async function loadSpecContent(filename: string): Promise<string> {
+    const forceLocal = process.env.FORCE_LOCAL_SPECS === "true";
+
+    // 1. Force local mode
+    if (forceLocal) {
+        return readFileSync(join(SPECS_DIR, filename), "utf-8");
+    }
+
+    // 2. Valid cache exists — use it
+    if (isCacheValid(filename)) {
+        return readFromCache(filename);
+    }
+
+    // 3. Try GitHub (with PAT if available)
+    try {
+        const content = await fetchSpecFromGitHub(filename);
+        writeToCache(filename, content); // cache for next time
+        return content;
+    } catch (githubError: any) {
+        const isRateLimit = githubError.message?.includes("rate limit");
+
+        // 4. Rate limited — try stale cache before falling back to bundled
+        if (isRateLimit && existsSync(getCachePath(filename))) {
+            console.error(`[specs] Rate limited — using stale cache for ${filename}`);
+            return readFromCache(filename);
+        }
+
+        // 5. Any other error — fall back to bundled local spec
+        console.error(`[specs] GitHub fetch failed for ${filename}, using local: ${githubError.message}`);
+        return readFileSync(join(SPECS_DIR, filename), "utf-8");
+    }
+}
+
+async function loadAllSpecs(): Promise<Record<string, any>> {
     const allPaths: Record<string, any> = {};
 
-    const files = readdirSync(SPECS_DIR).filter(f => f.endsWith(".yaml"));
+    // Load all spec files in parallel for speed
+    const results = await Promise.allSettled(
+        SPEC_FILES.map(async (file) => {
+            const content = await loadSpecContent(file);
+            return { file, content };
+        })
+    );
 
-    for (const file of files) {
-        const content = readFileSync(join(SPECS_DIR, file), "utf-8");
-        const parsed = yaml.load(content) as any;
+    for (const result of results) {
+        if (result.status === "rejected") {
+            console.error(`[specs] Failed to load a spec file:`, result.reason);
+            continue;
+        }
+
+        const { file, content } = result.value;
+
+        let parsed: any;
+        try {
+            parsed = yaml.load(content);
+        } catch (e) {
+            console.error(`[specs] Failed to parse ${file}:`, e);
+            continue;
+        }
 
         if (!parsed?.paths) continue;
 
@@ -24,7 +169,6 @@ function loadAllSpecs(): Record<string, any> {
             for (const [method, operation] of Object.entries(methods) as any) {
                 if (!operation?.operationId) continue;
 
-                // Resolve shared $ref parameters from components
                 const resolvedParams = resolveParameters(
                     operation.parameters || [],
                     parsed.components?.parameters || {}
@@ -156,29 +300,59 @@ function deriveFriendlyName(operationId: string): string {
 // to all resolve to the same endpoint
 
 function fuzzyMatch(requested: string, index: Record<string, any>): any | null {
-    const lower = requested.toLowerCase();
+    const lower = requested.toLowerCase().trim();
 
     // 1. Exact operationId match
     if (index[requested]) return index[requested];
 
-    // 2. Friendly name match (e.g. "sendMessage")
+    // 2. Exact friendly name match
     for (const entry of Object.values(index)) {
         if (deriveFriendlyName(entry.operationId).toLowerCase() === lower) {
             return entry;
         }
     }
 
-    // 3. Partial operationId match (e.g. "chat.sendMessage")
+    // 3. Partial operationId match
     for (const entry of Object.values(index)) {
         if (entry.operationId.toLowerCase().includes(lower)) {
             return entry;
         }
     }
 
-    // 4. Summary keyword match (e.g. "send message")
+    // 4. Summary keyword match
     for (const entry of Object.values(index)) {
         if (entry.summary.toLowerCase().includes(lower)) {
             return entry;
+        }
+    }
+
+    // 5. HTTP path segment match
+    // "deleteMessage" → matches "/api/v1/chat.delete" because path contains "delete"
+    // "channelHistory" → matches "/api/v1/channels.history"
+    const pathKeyword = lower
+        .replace(/([a-z])([A-Z])/g, "$1 $2") // camelCase → "delete Message"
+        .toLowerCase()
+        .split(" ")
+        .filter(w => w.length > 3); // ignore short words like "get", "the"
+
+    for (const entry of Object.values(index)) {
+        const pathLower = entry.httpPath.toLowerCase();
+        if (pathKeyword.every((word: string) => pathLower.includes(word))) {
+            return entry;
+        }
+    }
+
+    // 6. Dot-notation path match
+    // "chat.delete" → matches operationId "post-api-v1-chat.delete"
+    if (lower.includes(".")) {
+        for (const entry of Object.values(index)) {
+            if (entry.operationId.toLowerCase().includes(lower)) {
+                return entry;
+            }
+            // Also match against HTTP path: "chat.delete" → "/api/v1/chat.delete"
+            if (entry.httpPath.toLowerCase().includes(lower.replace(".", "."))) {
+                return entry;
+            }
         }
     }
 
@@ -188,13 +362,183 @@ function fuzzyMatch(requested: string, index: Record<string, any>): any | null {
 // ─── PUBLIC API ───────────────────────────────────────────────────────────────
 
 let _index: Record<string, any> | null = null;
+let _loading = false;
+
+export async function initializeIndex(): Promise<void> {
+    if (_index) return;
+    if (_loading) {
+        while (_loading) await new Promise(r => setTimeout(r, 50));
+        return;
+    }
+    _loading = true;
+    try {
+        _index = await loadAllSpecs();
+    } finally {
+        _loading = false;
+    }
+}
 
 function getIndex(): Record<string, any> {
-    if (!_index) _index = loadAllSpecs();
+    if (!_index) throw new Error("Spec index not initialized. Call initializeIndex() first.");
     return _index;
 }
 
-export function listAllApis(): Array<{ operationId: string; friendlyName: string; summary: string; httpMethod: string; httpPath: string; sourceFile: string }> {
+
+// ─── KEYWORD INDEX ────────────────────────────────────────────────────────────
+// Built once at startup, used to narrow candidates before LLM reasoning
+
+interface KeywordIndex {
+    keywords: Record<string, string[]>; // keyword → list of operationIds
+    categories: Record<string, string[]>; // category → list of operationIds
+}
+
+let _keywordIndex: KeywordIndex | null = null;
+
+function buildKeywordIndex(): KeywordIndex {
+    const index = getIndex();
+    const keywords: Record<string, string[]> = {};
+    const categories: Record<string, string[]> = {};
+
+    for (const entry of Object.values(index) as any) {
+        const category = entry.sourceFile.replace(".yaml", "").replace(/-/g, " ");
+        const tagsText = (entry.tags || []).join(" ");
+        const descSnippet = (entry.description || "").slice(0, 200); // first 200 chars
+        const text = `${entry.summary} ${entry.description ? descSnippet : ""} ${entry.httpPath} ${entry.operationId} ${category} ${tagsText}`.toLowerCase();
+
+        // Extract meaningful words (ignore short/common words)
+        const stopWords = new Set(["the", "a", "an", "to", "of", "in", "for",
+            "and", "or", "by", "get", "set", "api", "v1", "with", "from"]);
+
+        const words = text
+            .replace(/[^a-z0-9\s]/g, " ")
+            .split(/\s+/)
+            .filter(w => w.length > 3 && !stopWords.has(w));
+
+        for (const word of words) {
+            if (!keywords[word]) keywords[word] = [];
+            if (!keywords[word].includes(entry.operationId)) {
+                keywords[word].push(entry.operationId);
+            }
+        }
+
+        // Index by category
+        const cat = entry.sourceFile.replace(".yaml", "");
+        if (!categories[cat]) categories[cat] = [];
+        categories[cat].push(entry.operationId);
+    }
+
+    return { keywords, categories };
+}
+
+function getKeywordIndex(): KeywordIndex {
+    if (!_keywordIndex) _keywordIndex = buildKeywordIndex();
+    return _keywordIndex;
+}
+
+// ─── SYNONYM MAP ──────────────────────────────────────────────────────────────
+// Ensures conceptually equivalent terms always cross-match
+
+const SYNONYMS: Record<string, string[]> = {
+    "auth": ["authentication", "login", "logout", "token", "oauth", "sso", "session", "2fa", "totp"],
+    "authentication": ["auth", "login", "logout", "token", "oauth", "sso", "session"],
+    "login": ["auth", "authentication", "signin", "sign"],
+    "logout": ["auth", "authentication", "signout"],
+    "message": ["messaging", "chat", "send", "post", "reply"],
+    "messaging": ["message", "chat", "send", "post", "reply"],
+    "channel": ["room", "group"],
+    "room": ["channel", "group"],
+    "user": ["member", "profile", "account"],
+    "notification": ["push", "alert", "subscribe"],
+    "integration": ["webhook", "trigger"],
+    "livechat": ["omnichannel", "visitor", "agent"],
+    "omnichannel": ["livechat", "visitor", "agent"],
+    "setting": ["config", "preference", "workspace"],
+    "statistic": ["statistics", "stats", "metrics"],
+    "statistics": ["statistic", "stats", "metrics"],
+};
+
+export function findCandidateApis(requirement: string): {
+    candidates: ReturnType<typeof listAllApis>;
+    matchedKeywords: string[];
+    coverage: number; // % of requirement keywords matched
+} {
+    const kwIndex = getKeywordIndex();
+    const index = getIndex();
+
+    // Extract keywords from the requirement itself
+    const stopWords = new Set(["the", "a", "an", "to", "of", "in", "for",
+        "and", "or", "by", "i", "we", "my", "want", "need", "build",
+        "create", "make", "that", "this", "with", "from", "can", "will",
+        "should", "when", "then", "also", "just", "some", "have"]);
+
+    const reqWords = requirement
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !stopWords.has(w));
+
+    // Expand with synonyms so e.g. "authentication" also searches "login", "token", etc.
+    const expandedWords = new Set(reqWords);
+    for (const word of reqWords) {
+        if (SYNONYMS[word]) {
+            for (const syn of SYNONYMS[word]) expandedWords.add(syn);
+        }
+        // Also check if any synonym key is a substring match
+        for (const [key, syns] of Object.entries(SYNONYMS)) {
+            if (word.includes(key) || key.includes(word)) {
+                for (const syn of syns) expandedWords.add(syn);
+                expandedWords.add(key);
+            }
+        }
+    }
+
+    // Score each API by how many requirement keywords it matches
+    const scores: Record<string, number> = {};
+
+    for (const word of expandedWords) {
+        // Exact keyword match
+        if (kwIndex.keywords[word]) {
+            for (const opId of kwIndex.keywords[word]) {
+                scores[opId] = (scores[opId] || 0) + 2; // exact match = 2 points
+            }
+        }
+
+        // Partial keyword match
+        for (const [indexed, opIds] of Object.entries(kwIndex.keywords)) {
+            if (indexed.includes(word) || word.includes(indexed)) {
+                for (const opId of opIds) {
+                    scores[opId] = (scores[opId] || 0) + 1; // partial = 1 point
+                }
+            }
+        }
+    }
+
+    // Sort by score, take top 20
+    const topIds = Object.entries(scores)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 20)
+        .map(([id]) => id);
+
+    const allApis = listAllApis();
+    const candidates = allApis.filter(a => topIds.includes(a.operationId));
+
+    // Calculate what % of requirement keywords found matches
+    const matchedKeywords = [...expandedWords].filter(w =>
+        kwIndex.keywords[w] || Object.keys(kwIndex.keywords).some(k => k.includes(w))
+    );
+
+    return {
+        candidates,
+        matchedKeywords,
+        coverage: reqWords.length > 0
+            ? Math.round((matchedKeywords.length / reqWords.length) * 100)
+            : 0,
+    };
+}
+
+
+
+export function listAllApis(): Array<{ operationId: string; friendlyName: string; summary: string; httpMethod: string; httpPath: string; sourceFile: string; category: string }> {
     const index = getIndex();
     return Object.values(index).map(entry => ({
         operationId: entry.operationId,
@@ -203,6 +547,10 @@ export function listAllApis(): Array<{ operationId: string; friendlyName: string
         httpMethod: entry.httpMethod,
         httpPath: entry.httpPath,
         sourceFile: entry.sourceFile,
+        category: entry.sourceFile
+            .replace(".yaml", "")
+            .replace(/-/g, " ")
+            .toLowerCase(),
     }));
 }
 

@@ -20,6 +20,12 @@
             "description": "Your Rocket.Chat user ID",
             "envVar": "RC_USER_ID",
             "sensitive": true
+        },
+        {
+            "name": "GitHub PAT",
+            "description": "GitHub Personal Access Token for fetching RC OpenAPI specs without rate limits",
+            "envVar": "GITHUB_PAT",
+            "sensitive": true
         }
     ],
     "mcpServers": {

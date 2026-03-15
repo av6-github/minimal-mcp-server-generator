@@ -1,21 +1,21 @@
 ---
 name: mcp-generator
 description: >
-  Specialized expertise for generating minimal MCP servers from Rocket.Chat
-  API specs. Activate when the user asks to generate an MCP server, reduce
-  context bloat, or create a minimal tool set for Rocket.Chat integration.
+  Generate minimal MCP servers from Rocket.Chat API specs. Activate when
+  user asks to generate an MCP server or reduce context bloat.
 ---
 
-# MCP Generator Skill
+# MCP Generator — Strict Workflow
 
-## Workflow
-1. Understand which Rocket.Chat APIs the project actually needs
-2. Call `list_rocketchat_apis` if the user needs to explore options
-3. Call `generate_mcp_server` with the chosen API list
-4. Report output path, tool count, and token savings
+Follow these steps in order. Do not skip or combine steps.
 
-## Key facts
-- Each MCP tool definition costs ~250 tokens in context
-- Full RC server: ~100+ tools = ~25,000 tokens of overhead per loop
-- Minimal server with 5 tools = ~1,250 tokens (94% reduction)
-- Generated servers are production-ready: typed TS, Zod validation, tests included
+1. Call `analyze_requirements` with the user's requirement
+2. Call `propose_mcp_server` using EXACTLY the paths from analyze_requirements output — do NOT call `list_rocketchat_apis` to verify
+3. Wait for user confirmation (add/remove/confirm)
+4. Call `ask_server_name` and wait for user response
+5. Call `generate_mcp_server` with confirmed APIs and server name
+
+Rules:
+- Prefer `postMessage` over `sendMessage` always
+- Use full path format for ambiguous names: `chat.delete` not `delete`
+- Never call `list_rocketchat_apis` during generation flow — `analyze_requirements` already pre-filters

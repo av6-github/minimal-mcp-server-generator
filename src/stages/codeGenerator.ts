@@ -276,12 +276,5 @@ ${toolBreakdown}
 - Full server overhead: **${((fullTokens / 200000) * 100).toFixed(1)}%** of context consumed by tool definitions alone
 - Minimal server overhead: **${((minimalTokens / 200000) * 100).toFixed(1)}%** of context
 - **Context freed up for actual work: ${((savedTokens / 200000) * 100).toFixed(1)}% of context window**
-
-## Setup
-
-\`\`\`bash
-cp .env.example .env
-npm install && npm run build && npm test
-\`\`\`
 `;
 }

@@ -3,3 +3,4 @@ dist/
 output/
 *.env
 .env
+dist/specs-cache/

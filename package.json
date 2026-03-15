@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "copy-specs": "cp -r src/specs dist/specs",
     "dev": "ts-node --esm src/server.ts"
   },
   "dependencies": {
