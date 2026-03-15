@@ -9,6 +9,7 @@
     "dev": "ts-node --esm src/server.ts"
   },
   "dependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "js-yaml": "^4.1.0",
     "vitest": "^4.1.0",
@@ -17,6 +18,7 @@
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
+    "@types/swagger-parser": "^4.0.3",
     "ts-node": "^10.9.0",
     "typescript": "^5.0.0"
   }

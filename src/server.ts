@@ -3,13 +3,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { listAllApis, resolveApis, findCandidateApis, initializeIndex } from "./stages/specResolver.js";
+import { listAllApis, resolveApis, findCandidateApis, initializeIndex, getTagDetail, getTagSummaries } from "./stages/specResolver.js";
 import { mapToMCPSchema } from "./stages/schemaMapper.js";
 import { writeOutput } from "./stages/outputWriter.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { execSync } from "child_process";
-
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const server = new McpServer({
@@ -53,6 +52,21 @@ function linkGeneratedServer(outputPath: string, linkedServerName: string): stri
 
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
     return settingsPath;
+}
+
+// Helper to build tag groups from a flat candidate list
+// Used when fallback filtering bypasses findCandidateApis tag grouping
+function buildTagGroupsFromCandidates(
+    candidates: ReturnType<typeof listAllApis>
+): Record<string, { endpoints: ReturnType<typeof listAllApis>; totalInTag: number }> {
+    const groups: Record<string, { endpoints: ReturnType<typeof listAllApis>; totalInTag: number }> = {};
+    for (const c of candidates) {
+        const tag = c.sourceFile.replace(".yaml", "");
+        if (!groups[tag]) groups[tag] = { endpoints: [], totalInTag: 0 };
+        groups[tag].endpoints.push(c);
+        groups[tag].totalInTag++;
+    }
+    return groups;
 }
 
 // ─── TOOL 1: List all available RC APIs ──────────────────────────────────────
@@ -122,6 +136,70 @@ server.tool(
 
         lines.push(`\n💡 A full server with all ${all.length} APIs costs ~${all.length * 250} tokens in context.`);
         lines.push(`A minimal server with 5 APIs costs ~1,250 tokens — a ${Math.round(((all.length - 5) / all.length) * 100)}% reduction.`);
+
+        return {
+            content: [{ type: "text", text: lines.join("\n") }],
+        };
+    }
+);
+
+// ─── TOOL: Browse APIs by tag (progressive disclosure) ────────────────────────
+
+server.tool(
+    "browse_apis_by_tag",
+    "Browse RC APIs using progressive disclosure. Call with no tag to see high-level tag summaries (cheap — just counts and names). Call with a specific tag to expand and see all endpoints in that tag. Use this before analyze_requirements when the user wants to explore available APIs.",
+    {
+        tag: z.string().optional().describe(
+            "Tag name to expand. Omit to see all tag summaries. Examples: 'Chat', 'Channels', 'Users', 'Authentication'"
+        ),
+    },
+    async ({ tag }) => {
+        if (!tag) {
+            // Phase 1 — Show tag summaries only (very cheap)
+            const summaries = getTagSummaries();
+            const allApis = listAllApis();
+
+            const lines = [
+                `## Rocket.Chat API Tags (${summaries.length} tags, ${allApis.length} total endpoints)\n`,
+                `Browse by tag to see specific endpoints. Only the tags you expand cost tokens.\n`,
+                `| Tag | Endpoints | Sample APIs |`,
+                `|-----|-----------|-------------|`,
+                ...summaries.map(s =>
+                    `| **${s.tag}** | ${s.endpointCount} | ${s.sampleEndpoints.join(", ")} |`
+                ),
+                `\n💡 Call \`browse_apis_by_tag\` with a tag name to see its endpoints.`,
+                `💡 Full server: ~${allApis.length * 250} tokens. A 5-tool server: ~1,250 tokens (99% reduction).`,
+            ];
+
+            return {
+                content: [{ type: "text", text: lines.join("\n") }],
+            };
+        }
+
+        // Phase 2 — Expand a specific tag (only pay tokens for what you asked for)
+        const detail = getTagDetail(tag);
+
+        if (!detail) {
+            const summaries = getTagSummaries();
+            const available = summaries.map(s => s.tag).join(", ");
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Tag "${tag}" not found.\n\nAvailable tags: ${available}`,
+                }],
+                isError: true,
+            };
+        }
+
+        const tokenCost = detail.endpoints.length * 15;
+        const lines = [
+            `## Tag: ${detail.tag} (${detail.endpoints.length} endpoints)\n`,
+            ...detail.endpoints.map(e =>
+                `- **${e.friendlyName}** — ${e.summary} (\`${e.httpMethod} ${e.httpPath}\`)`
+            ),
+            `\n**Token cost to load this tag's schemas:** ~${tokenCost} tokens`,
+            `\n💡 Add any of these to your server with \`propose_mcp_server\` or \`/generate-mcp\`.`,
+        ];
 
         return {
             content: [{ type: "text", text: lines.join("\n") }],
@@ -365,7 +443,8 @@ server.tool(
         ),
     },
     async ({ requirements }) => {
-        const { candidates, matchedKeywords, coverage } = findCandidateApis(requirements);
+        const result = findCandidateApis(requirements);
+        const { candidates, matchedKeywords, coverage } = result;
         const allApis = listAllApis();
 
         // Fallback to category-based filtering if keyword coverage is too low
@@ -377,7 +456,7 @@ server.tool(
                 "messaging": ["message", "chat", "send", "post", "reply", "thread", "mention", "pin", "star"],
                 "rooms": ["channel", "room", "group", "create", "join", "leave", "archive", "rename", "topic"],
                 "user-management": ["user", "profile", "account", "member", "role", "permission", "status"],
-                "authentication": ["login", "auth", "token", "logout", "password", "session", "oauth"],
+                "authentication": ["login", "auth", "authentication", "token", "oauth", "password", "session", "2fa", "credentials", "signin", "signup"],
                 "omnichannel": ["livechat", "visitor", "agent", "omnichannel", "support", "ticket", "department"],
                 "integrations": ["webhook", "integration", "trigger", "incoming", "outgoing"],
                 "notifications": ["notification", "push", "alert", "subscribe", "email"],
@@ -406,10 +485,40 @@ server.tool(
             }
         }
 
-        // Build compact catalogue
-        const catalogue = finalCandidates
-            .map(a => `${a.friendlyName} | ${a.summary} | ${a.httpMethod} ${a.httpPath}`)
-            .join("\n");
+        // Build tag groups — MUST come after finalCandidates is resolved
+        const tagGroups = fallbackUsed
+            ? buildTagGroupsFromCandidates(finalCandidates)
+            : result.tagGroups;
+
+        // Build tag-grouped catalogue
+        const tagGroupedLines: string[] = [];
+
+        if (Object.keys(tagGroups).length > 0) {
+            for (const [tag, group] of Object.entries(tagGroups)) {
+                const tagCandidates = group.endpoints.filter(e =>
+                    finalCandidates.find(f => f.operationId === e.operationId)
+                );
+                if (tagCandidates.length === 0) continue;
+
+                tagGroupedLines.push(
+                    `\n### ${tag} (${tagCandidates.length} relevant of ${group.totalInTag} total)`
+                );
+                for (const api of tagCandidates) {
+                    tagGroupedLines.push(
+                        `${api.friendlyName} | ${api.summary} | ${api.httpMethod} ${api.httpPath}`
+                    );
+                }
+            }
+        } else {
+            // Fallback — flat list if no tags available
+            for (const a of finalCandidates) {
+                tagGroupedLines.push(
+                    `${a.friendlyName} | ${a.summary} | ${a.httpMethod} ${a.httpPath}`
+                );
+            }
+        }
+
+        const catalogue = tagGroupedLines.join("\n");
 
         const tokensBefore = allApis.length * 15;
         const tokensAfter = finalCandidates.length * 15;
@@ -419,8 +528,7 @@ server.tool(
             ? `category-based fallback (keyword coverage was ${coverage}%)`
             : `keyword matching (${coverage}% coverage)`;
 
-        // Build pre-selected suggestion — derive unambiguous API identifiers
-        // For ambiguous friendly names (delete, create, list etc.) use path-based name
+        // Build pre-selected suggestion
         const ambiguousNames = new Set(["delete", "create", "list", "info", "update",
             "history", "close", "open", "join", "leave", "invite", "kick", "rename"]);
 
@@ -428,7 +536,6 @@ server.tool(
 
         const suggestedApiNames = topCandidates.map(a => {
             if (ambiguousNames.has(a.friendlyName)) {
-                // Use path segment: /api/v1/chat.delete → "chat.delete"
                 const pathSegment = a.httpPath.split("/api/v1/")[1] ||
                     a.httpPath.split("/api/")[1] ||
                     a.friendlyName;
@@ -449,30 +556,30 @@ server.tool(
                 type: "text",
                 text: `## Requirements Analysis
 
-**Requirement:** ${requirements}
+        **Requirement:** ${requirements}
 
-**Pre-filtering result:**
-- Method: ${filterMethod}
-- Matched keywords: ${matchedKeywords.length > 0 ? matchedKeywords.join(", ") : "none — used category fallback"}
-- Narrowed from ${allApis.length} APIs → ${finalCandidates.length} candidates
-- Token savings: ~${tokensSaved} tokens
+        **Pre-filtering result:**
+        - Method: ${filterMethod}
+        - Matched keywords: ${matchedKeywords.length > 0 ? matchedKeywords.join(", ") : "none — used category fallback"}
+        - Narrowed from ${allApis.length} APIs → ${finalCandidates.length} candidates
+        - Token savings: ~${tokensSaved} tokens
 
-**Relevant API candidates (${finalCandidates.length}):**
-${catalogue}
+        **Relevant API candidates by tag:**
+        ${catalogue}
 
----
-**⚡ Suggested selection — call \`propose_mcp_server\` with this directly:**
-\`\`\`
-proposedApis: [${suggestedApiNames.join(", ")}]
-reasoning: { ${suggestedReasoning.join(", ")} }
-\`\`\`
+        ---
+        **⚡ Suggested selection — call \`propose_mcp_server\` with this directly:**
+        \`\`\`
+        proposedApis: [${suggestedApiNames.join(", ")}]
+        reasoning: { ${suggestedReasoning.join(", ")} }
+        \`\`\`
 
-**Rules:**
-- Use the suggested selection above as a starting point — adjust only if needed
-- Prefer \`postMessage\` over \`sendMessage\` for any message sending
-- For ambiguous names (delete, create, list etc.) always use path format: \`chat.delete\` not \`delete\`
-- ⚠️ Do NOT call \`list_rocketchat_apis\` to verify — paths above are authoritative
-- Call \`propose_mcp_server\` now with the selection above`,
+        **Rules:**
+        - Use the suggested selection above as a starting point — adjust only if needed
+        - Prefer \`postMessage\` over \`sendMessage\` for any message sending
+        - For ambiguous names (delete, create, list etc.) always use path format: \`chat.delete\` not \`delete\`
+        - ⚠️ Do NOT call \`list_rocketchat_apis\` to verify — paths above are authoritative
+        - Call \`propose_mcp_server\` now with the selection above`,
             }],
         };
     }

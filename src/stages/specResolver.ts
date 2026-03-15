@@ -3,6 +3,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import yaml from "js-yaml";
 import type { RCEndpoint, RCParameter } from "./types.js";
+import SwaggerParser from "@apidevtools/swagger-parser";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SPECS_DIR = join(__dirname, "../specs");
@@ -157,9 +158,15 @@ async function loadAllSpecs(): Promise<Record<string, any>> {
 
         let parsed: any;
         try {
-            parsed = yaml.load(content);
+            // First parse the YAML
+            const rawParsed = yaml.load(content) as any;
+
+            // Then fully dereference all $refs — this resolves nested schema
+            // references, shared component definitions, and complex allOf/oneOf/anyOf
+            // that our manual resolver missed
+            parsed = await SwaggerParser.dereference(rawParsed as any);
         } catch (e) {
-            console.error(`[specs] Failed to parse ${file}:`, e);
+            console.error(`[specs] Failed to parse/dereference ${file}:`, e);
             continue;
         }
 
@@ -169,20 +176,19 @@ async function loadAllSpecs(): Promise<Record<string, any>> {
             for (const [method, operation] of Object.entries(methods) as any) {
                 if (!operation?.operationId) continue;
 
-                const resolvedParams = resolveParameters(
-                    operation.parameters || [],
-                    parsed.components?.parameters || {}
-                );
-
                 allPaths[operation.operationId] = {
+                    // Lightweight summary — always loaded
                     operationId: operation.operationId,
                     summary: operation.summary || "",
                     httpMethod: method.toUpperCase(),
                     httpPath: path,
-                    rawParameters: resolvedParams,
-                    requestBody: operation.requestBody || null,
                     sourceFile: file,
-                    components: parsed.components || {},
+                    tags: operation.tags || [],
+
+                    // Heavy data — deferred until resolveApis is called
+                    _rawParameters: operation.parameters || [],
+                    _rawRequestBody: operation.requestBody || null,
+                    _components: parsed.components?.parameters || {},
                 };
             }
         }
@@ -460,7 +466,11 @@ const SYNONYMS: Record<string, string[]> = {
 export function findCandidateApis(requirement: string): {
     candidates: ReturnType<typeof listAllApis>;
     matchedKeywords: string[];
-    coverage: number; // % of requirement keywords matched
+    coverage: number;
+    tagGroups: Record<string, {
+        endpoints: ReturnType<typeof listAllApis>;
+        totalInTag: number;
+    }>;
 } {
     const kwIndex = getKeywordIndex();
     const index = getIndex();
@@ -527,12 +537,42 @@ export function findCandidateApis(requirement: string): {
         kwIndex.keywords[w] || Object.keys(kwIndex.keywords).some(k => k.includes(w))
     );
 
+    // Group candidates by tag for structured output
+    const tagGroups: Record<string, {
+        endpoints: typeof candidates;
+        totalInTag: number;
+    }> = {};
+
+    for (const candidate of candidates) {
+        const entry = (index as any)[candidate.operationId];
+        const tags: string[] = entry?.tags?.length > 0
+            ? entry.tags
+            : [candidate.sourceFile.replace(".yaml", "")];
+
+        for (const tag of tags) {
+            if (!tagGroups[tag]) {
+                // Count total endpoints in this tag across the full index
+                const totalInTag = Object.values(index).filter((e: any) =>
+                    (e.tags?.length > 0 ? e.tags : [e.sourceFile.replace(".yaml", "")])
+                        .includes(tag)
+                ).length;
+
+                tagGroups[tag] = { endpoints: [], totalInTag };
+            }
+            // Avoid duplicates within a tag group
+            if (!tagGroups[tag].endpoints.find(e => e.operationId === candidate.operationId)) {
+                tagGroups[tag].endpoints.push(candidate);
+            }
+        }
+    }
+
     return {
         candidates,
         matchedKeywords,
         coverage: reqWords.length > 0
             ? Math.round((matchedKeywords.length / reqWords.length) * 100)
             : 0,
+        tagGroups,
     };
 }
 
@@ -562,16 +602,30 @@ export function resolveApis(requested: string[]): {
     const resolved: RCEndpoint[] = [];
     const notFound: string[] = [];
 
+    // Apply API preferences before resolving
+    const API_PREFERENCES: Record<string, string> = {
+        "sendMessage": "postMessage",
+        "chat.sendMessage": "postMessage",
+        "post-api-v1-chat.sendMessage": "postMessage",
+    };
+
     for (const name of requested) {
-        const match = fuzzyMatch(name, index);
+        const preferredName = API_PREFERENCES[name] || name;
+        const match = fuzzyMatch(preferredName, index);
         if (!match) {
             notFound.push(name);
             continue;
         }
 
-        const queryParams = extractQueryParameters(match.rawParameters);
-        const bodyParams = extractBodyParameters(match.requestBody);
+        // ── Lazy extraction — only runs for selected endpoints ──────────────
+        const resolvedParams = resolveParameters(
+            match._rawParameters || [],
+            match._components || {}
+        );
+        const queryParams = extractQueryParameters(resolvedParams);
+        const bodyParams = extractBodyParameters(match._rawRequestBody);
         const allParams = [...queryParams, ...bodyParams];
+        // ────────────────────────────────────────────────────────────────────
 
         resolved.push({
             operationId: match.operationId,
@@ -585,4 +639,84 @@ export function resolveApis(requested: string[]): {
     }
 
     return { resolved, notFound };
+}
+
+// ─── TAG-BASED BROWSING ───────────────────────────────────────────────────────
+
+export interface TagSummary {
+    tag: string;
+    sourceFile: string;
+    endpointCount: number;
+    description: string;
+    sampleEndpoints: string[]; // first 3 endpoint summaries
+}
+
+export interface TagDetail {
+    tag: string;
+    endpoints: Array<{
+        operationId: string;
+        friendlyName: string;
+        summary: string;
+        httpMethod: string;
+        httpPath: string;
+    }>;
+}
+
+export function getTagSummaries(): TagSummary[] {
+    const index = getIndex();
+    const tagMap: Record<string, {
+        sourceFile: string;
+        endpoints: any[];
+    }> = {};
+
+    for (const entry of Object.values(index) as any) {
+        const tags: string[] = entry.tags || [entry.sourceFile.replace(".yaml", "")];
+        for (const tag of tags) {
+            if (!tagMap[tag]) {
+                tagMap[tag] = { sourceFile: entry.sourceFile, endpoints: [] };
+            }
+            tagMap[tag].endpoints.push(entry);
+        }
+    }
+
+    return Object.entries(tagMap)
+        .map(([tag, data]) => ({
+            tag,
+            sourceFile: data.sourceFile,
+            endpointCount: data.endpoints.length,
+            description: `${data.endpoints.length} endpoints in ${data.sourceFile.replace(".yaml", "")}`,
+            sampleEndpoints: data.endpoints
+                .slice(0, 3)
+                .map((e: any) => e.summary),
+        }))
+        .sort((a, b) => b.endpointCount - a.endpointCount);
+}
+
+export function getTagDetail(tagName: string): TagDetail | null {
+    const index = getIndex();
+    const endpoints: TagDetail["endpoints"] = [];
+
+    for (const entry of Object.values(index) as any) {
+        const tags: string[] = entry.tags ||
+            [entry.sourceFile.replace(".yaml", "")];
+
+        const matches = tags.some(t =>
+            t.toLowerCase() === tagName.toLowerCase() ||
+            t.toLowerCase().includes(tagName.toLowerCase())
+        );
+
+        if (matches) {
+            endpoints.push({
+                operationId: entry.operationId,
+                friendlyName: deriveFriendlyName(entry.operationId),
+                summary: entry.summary,
+                httpMethod: entry.httpMethod,
+                httpPath: entry.httpPath,
+            });
+        }
+    }
+
+    if (endpoints.length === 0) return null;
+
+    return { tag: tagName, endpoints };
 }
