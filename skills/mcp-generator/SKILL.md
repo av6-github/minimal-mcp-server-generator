@@ -19,3 +19,4 @@ Rules:
 - Prefer `postMessage` over `sendMessage` always
 - Use full path format for ambiguous names: `chat.delete` not `delete`
 - Never call `list_rocketchat_apis` during generation flow — `analyze_requirements` already pre-filters
+- `add_api_to_server` — add missing APIs to an existing generated server

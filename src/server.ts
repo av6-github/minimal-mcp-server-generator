@@ -6,9 +6,13 @@ import { fileURLToPath } from "url";
 import { listAllApis, resolveApis, findCandidateApis, initializeIndex, getTagDetail, getTagSummaries } from "./stages/specResolver.js";
 import { mapToMCPSchema } from "./stages/schemaMapper.js";
 import { writeOutput } from "./stages/outputWriter.js";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { generatePackageJson, generateTsConfig, generateEnvExample } from "./stages/codeGenerator.js";
+import { decomposeWorkflow, generateWorkflowToolCode, RC_CLIENT_TEMPLATE, type WorkflowTool } from "./stages/workflowDecomposer.js";
+
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const server = new McpServer({
@@ -300,25 +304,273 @@ The server will be accessible as \`rocketchat-<name>\` in gemini-cli.`,
     }
 );
 
+// ─── TOOL: Decompose workflow ─────────────────────────────────────────────────
+
+server.tool(
+    "decompose_workflow",
+    "Decompose a plain English workflow description into structured tool definitions. Each tool may internally call multiple RC APIs. Use this for Mode 2 generation when the developer describes a task rather than specific APIs.",
+    {
+        requirement: z.string().describe(
+            "Plain English description of the workflow e.g. 'onboard new team members' or 'archive inactive channels and notify users'"
+        ),
+    },
+    async ({ requirement }) => {
+        const { definition, tokenCost } = await decomposeWorkflow(requirement);
+
+        // Template match — return structured result immediately
+        if (definition.source === "template" && definition.tools.length > 0) {
+            const toolSummaries = definition.tools.map(t => {
+                const stepList = t.steps
+                    .map(s => `    ${s.stepNumber}. ${s.description} → \`${s.apiName}\``)
+                    .join("\n");
+                const inputList = t.inputs
+                    .map(i => `  - \`${i.name}\` (${i.type}${i.required ? ", required" : ", optional"}): ${i.description}`)
+                    .join("\n");
+                return `### \`${t.name}\`
+**Description:** ${t.description}
+
+**Inputs:**
+${inputList}
+
+**Steps:**
+${stepList}`;
+            }).join("\n\n");
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `## ⚡ Workflow Decomposed (from template — 0 tokens used)
+
+**Requirement:** ${requirement}
+
+${toolSummaries}
+
+**Token cost:** 0 (matched known workflow template)
+
+---
+Does this workflow match what you need?
+- ✅ Type **"confirm"** to generate this workflow server
+- ✏️  Type **"adjust step X"** to modify a specific step
+- ➕ Type **"add step"** to add another step to the workflow
+- 🔄 Type **"custom"** if this doesn't match — I'll analyze your requirement with the LLM`,
+                }],
+            };
+        }
+
+        // LLM fallback — return catalogue and let gemini reason
+        const { candidates } = findCandidateApis(requirement);
+        const catalogue = candidates
+            .map(a => `${a.friendlyName} | ${a.summary} | ${a.httpMethod} ${a.httpPath}`)
+            .join("\n");
+
+        return {
+            content: [{
+                type: "text",
+                text: `## Workflow Analysis Required
+
+**Requirement:** ${requirement}
+
+No template found for this workflow. Estimated token cost: ~${tokenCost} tokens.
+
+**Relevant RC APIs for this workflow (${candidates.length} candidates):**
+${catalogue}
+
+**Your task:** Design a workflow tool for this requirement.
+1. Define the tool name and description
+2. Define the minimal high-level inputs (hide implementation details)
+3. Break it into ordered steps, each mapping to one RC API above
+4. Then call \`generate_mcp_server\` with the workflow definition
+
+**Output format:**
+\`\`\`json
+[
+  {
+    "name": "yourToolName",
+    "description": "what this tool does for the user",
+    "inputs": [
+      {"name": "paramName", "type": "string", "required": true, "description": "what it is"}
+    ],
+    "steps": [
+      {
+        "stepNumber": 1,
+        "description": "what this step does",
+        "apiName": "channels.info",
+        "purpose": "why this step is needed",
+        "iterateOver": null,
+        "filterBy": null,
+        "filterField": null
+      },
+      {
+        "stepNumber": 2,
+        "description": "get all members",
+        "apiName": "channels.members",
+        "purpose": "fetch member list to iterate over",
+        "iterateOver": null,
+        "filterBy": null,
+        "filterField": null
+      },
+      {
+        "stepNumber": 3,
+        "description": "kick each matching member",
+        "apiName": "channels.kick",
+        "purpose": "remove users matching the filter",
+        "iterateOver": "members",
+        "filterBy": "keyword",
+        "filterField": "username"
+      }
+    ],
+    "resolvedApis": []
+  }
+]
+\`\`\`
+
+**Rules for iterateOver:**
+- Set \`iterateOver\` to the array field name from the PREVIOUS step's result when this step must loop (e.g. "members" from channels.members result, "messages" from channels.history result)
+- Set \`filterBy\` to the tool input name used as the filter value (e.g. "keyword", "daysOld")
+- Set \`filterField\` to the field on each array item to match against (e.g. "username", "_id", "name")
+- Set all three to null for single-call steps
+- Use iterateOver whenever the step says "each", "all", "every", "loop", "for each", "filter and"
+
+**The workflowDefinition passed to generate_mcp_server must be JSON.stringify() of this array.**`,
+            }],
+        };
+    }
+);
+
 // ─── TOOL 3: Generate the minimal MCP server ─────────────────────────────────
 
 server.tool(
     "generate_mcp_server",
-    "Generate a minimal production-ready MCP server for a specified subset of Rocket.Chat APIs. Output includes TypeScript source, tests, package.json, tsconfig, .env.example, and README.",
+    "Generate a minimal MCP server. Mode 1: pass apis list for individual tool wrappers. Mode 2: pass workflowDefinition JSON string for composite workflow tools.",
     {
-        apis: z.array(z.string()).describe(
-            "List of API names to include. Can use friendly names like 'postMessage', 'getChannels', or operationIds."
+        apis: z.array(z.string()).optional().describe(
+            "Mode 1: list of RC API names to wrap as individual tools"
+        ),
+        workflowDefinition: z.string().optional().describe(
+            "Mode 2: JSON string of WorkflowTool[] from decompose_workflow"
         ),
         outputPath: z.string().optional().describe(
             "Output directory path. Defaults to ./output/<serverName>"
         ),
         serverName: z.string().optional().describe(
-            "A short memorable name e.g. 'messaging', 'channels', 'admin'. Used as the server identifier in gemini-cli."
+            "Short memorable name e.g. 'messaging', 'channels', 'admin'."
         ),
     },
-    async ({ apis, outputPath, serverName }) => {
+    async ({ apis, workflowDefinition, outputPath, serverName }) => {
 
-        // Stage 1: Resolve API names from spec
+        const isWorkflowMode = !!workflowDefinition && (!apis || apis.length === 0);
+
+        // ── MODE 2: Workflow generation ──────────────────────────────────────────
+        if (isWorkflowMode) {
+            let workflowTools: WorkflowTool[];
+            try {
+                workflowTools = JSON.parse(workflowDefinition!);
+                if (!Array.isArray(workflowTools)) throw new Error("Expected array");
+            } catch {
+                return {
+                    content: [{ type: "text", text: "❌ Invalid workflowDefinition JSON. Use decompose_workflow first and pass its tools array as JSON." }],
+                    isError: true,
+                };
+            }
+
+            const resolvedServerName = serverName
+                ? `rocketchat-${serverName.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase()}`
+                : `rocketchat-workflow-${workflowTools.map(t => t.name).join("-").slice(0, 25)}`;
+
+            const resolvedOutput = outputPath ||
+                join(__dirname, `../output/${resolvedServerName}`);
+
+            // Create directory structure
+            mkdirSync(join(resolvedOutput, "src/client"), { recursive: true });
+            mkdirSync(join(resolvedOutput, "src/tests"), { recursive: true });
+
+            // Write shared RC client
+            writeFileSync(join(resolvedOutput, "src/client/rcClient.ts"), RC_CLIENT_TEMPLATE);
+
+            // Generate composite workflow tool code
+            // Resolve APIs for each workflow tool's steps before code generation
+            const enrichedWorkflowTools = workflowTools.map(tool => {
+                const apiNames = tool.steps.map(s => s.apiName);
+                const { resolved } = resolveApis(apiNames);
+                return {
+                    ...tool,
+                    resolvedApis: resolved,
+                };
+            });
+
+            // Generate composite workflow tool code
+            const workflowToolCode = enrichedWorkflowTools
+                .map(t => generateWorkflowToolCode(t))
+                .join("\n");
+
+            const serverFile = `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { _rc } from "./client/rcClient.js";
+
+const server = new McpServer({
+  name: "${resolvedServerName}",
+  version: "1.0.0",
+});
+${workflowToolCode}
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+`;
+
+            writeFileSync(join(resolvedOutput, "src/index.ts"), serverFile);
+            writeFileSync(join(resolvedOutput, "package.json"), generatePackageJson(workflowTools.length));
+            writeFileSync(join(resolvedOutput, "tsconfig.json"), generateTsConfig());
+            writeFileSync(join(resolvedOutput, ".env.example"), generateEnvExample());
+
+            // Auto-build
+            try {
+                execSync("npm install && npm run build", { cwd: resolvedOutput, stdio: "pipe" });
+            } catch (e: any) {
+                console.error("Auto-build failed:", e);
+            }
+
+            const settingsPath = linkGeneratedServer(resolvedOutput, resolvedServerName);
+
+            const totalApiCount = listAllApis().length;
+            const minTokens = workflowTools.length * 250;
+            const fullTokens = totalApiCount * 250;
+            const savedPct = Math.round(((fullTokens - minTokens) / fullTokens) * 100);
+            const totalSteps = workflowTools.reduce((s, t) => s + t.steps.length, 0);
+
+            const toolList = workflowTools
+                .map(t => `  - \`${t.name}\`: ${t.description} (${t.steps.length} RC API calls internally)`)
+                .join("\n");
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `## ✅ Workflow MCP Server Generated
+
+**Output:** \`${resolvedOutput}\`
+**Server name:** \`${resolvedServerName}\`
+**Mode:** Workflow (composite tools)
+
+**Tools generated (${workflowTools.length}):**
+${toolList}
+
+**Token cost:** ~${minTokens} tokens vs ~${fullTokens} for full server (${savedPct}% savings)
+**Runtime benefit:** ${totalSteps} RC API calls consolidated into ${workflowTools.length} tool call(s)
+
+**Auto-linked:** \`${settingsPath}\` as \`${resolvedServerName}\`
+⚠️  Restart gemini-cli to load the new server into your session.`,
+                }],
+            };
+        }
+
+        // ── MODE 1: API wrapper generation ───────────────────────────────────────
+        if (!apis || apis.length === 0) {
+            return {
+                content: [{ type: "text", text: "❌ Provide either `apis` (Mode 1) or `workflowDefinition` (Mode 2)." }],
+                isError: true,
+            };
+        }
+
         const { resolved, notFound } = resolveApis(apis);
 
         if (resolved.length === 0) {
@@ -331,10 +583,8 @@ server.tool(
             };
         }
 
-        // Stage 2: Map to MCP schemas
         const tools = resolved.map(mapToMCPSchema);
 
-        // Resolve server name — user-provided or auto-generated from tool names
         const resolvedServerName = serverName
             ? `rocketchat-${serverName.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase()}`
             : `rocketchat-${tools.map(t => t.name).join("-").slice(0, 30)}`;
@@ -342,26 +592,17 @@ server.tool(
         const resolvedOutput = outputPath ||
             join(__dirname, `../output/${resolvedServerName}`);
 
-        // Get total API count for token savings calculation
         const totalApiCount = listAllApis().length;
-
-        // Stages 3+4+5: Generate code, tests, and write to disk
         const outputDir = writeOutput(tools, totalApiCount, resolvedOutput);
 
-        // Auto-build the generated server
         try {
-            execSync("npm install && npm run build", {
-                cwd: outputDir,
-                stdio: "pipe",
-            });
+            execSync("npm install && npm run build", { cwd: outputDir, stdio: "pipe" });
         } catch (e: any) {
             console.error("Auto-build failed:", e);
         }
 
-        // Auto-link to gemini-cli settings
         const settingsPath = linkGeneratedServer(outputDir, resolvedServerName);
 
-        // Build response summary — real token analysis
         const toolTokenCosts = tools.map(t => {
             const tokens = Math.ceil(t.name.length / 4) +
                 Math.ceil(t.description.length / 4) +
@@ -580,6 +821,108 @@ server.tool(
         - For ambiguous names (delete, create, list etc.) always use path format: \`chat.delete\` not \`delete\`
         - ⚠️ Do NOT call \`list_rocketchat_apis\` to verify — paths above are authoritative
         - Call \`propose_mcp_server\` now with the selection above`,
+            }],
+        };
+    }
+);
+
+// ─── TOOL: Add API to existing server ────────────────────────────────────────
+
+server.tool(
+    "add_api_to_server",
+    "Add one or more new API tools to an already-generated MCP server without regenerating it from scratch. Use this when the user realizes they missed an API after generation.",
+    {
+        serverPath: z.string().describe(
+            "Absolute path to the generated server directory e.g. /home/user/.../output/rocketchat-channel-moderator"
+        ),
+        apis: z.array(z.string()).describe(
+            "List of API names to add e.g. ['channels.info', 'users.info']"
+        ),
+    },
+    async ({ serverPath, apis }) => {
+        // Verify server exists
+        if (!existsSync(join(serverPath, "src/index.ts"))) {
+            return {
+                content: [{ type: "text", text: `❌ No generated server found at ${serverPath}. Check the path.` }],
+                isError: true,
+            };
+        }
+
+        // Resolve the new APIs
+        const { resolved, notFound } = resolveApis(apis);
+        if (resolved.length === 0) {
+            return {
+                content: [{ type: "text", text: `❌ No matching APIs found for: ${apis.join(", ")}` }],
+                isError: true,
+            };
+        }
+
+        // Map to MCP schemas
+        const newTools = resolved.map(mapToMCPSchema);
+
+        // Read existing index.ts
+        const indexPath = join(serverPath, "src/index.ts");
+        let existing = readFileSync(indexPath, "utf-8");
+
+        // Generate code for each new tool
+        const { generateToolBlock } = await import("./stages/codeGenerator.js");
+        const newToolCode = newTools.map(t => generateToolBlock(t)).join("\n");
+
+        // Inject before the server startup line
+        const insertBefore = "// ── Start server";
+        if (existing.includes(insertBefore)) {
+            existing = existing.replace(insertBefore, `${newToolCode}\n\n${insertBefore}`);
+        } else {
+            // Fallback — inject before connect line
+            existing = existing.replace(
+                "await server.connect(transport);",
+                `${newToolCode}\n\nawait server.connect(transport);`
+            );
+        }
+
+        writeFileSync(indexPath, existing);
+
+        // Generate test files for new tools
+        const { generateTestFile } = await import("./stages/testGenerator.js");
+        for (const tool of newTools) {
+            const testPath = join(serverPath, `src/tests/${tool.name}.test.ts`);
+            if (!existsSync(testPath)) {
+                writeFileSync(testPath, generateTestFile(tool));
+            }
+        }
+
+        // Rebuild
+        try {
+            execSync("npm run build", { cwd: serverPath, stdio: "pipe" });
+        } catch (e: any) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `⚠️ Tools added to source but build failed. Fix manually:\n\`\`\`\ncd ${serverPath}\nnpm run build\n\`\`\`\nError: ${e.message}`,
+                }],
+            };
+        }
+
+        const toolList = newTools.map(t =>
+            `  - \`${t.name}\`: ${t.description}`
+        ).join("\n");
+
+        const warnings = notFound.length > 0
+            ? `\n⚠️ Not found (skipped): ${notFound.join(", ")}` : "";
+
+        return {
+            content: [{
+                type: "text",
+                text: `## ✅ Tools Added to Existing Server
+
+**Server:** \`${serverPath}\`
+
+**Added (${newTools.length}):**
+${toolList}
+
+**Rebuilt successfully.**
+⚠️ Restart gemini-cli to load the updated tools into your session.
+${warnings}`,
             }],
         };
     }

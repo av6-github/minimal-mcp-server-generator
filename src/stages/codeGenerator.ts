@@ -101,7 +101,7 @@ function generateHttpCall(tool: MCPToolSchema): string {
 }
 // ─── SINGLE TOOL BLOCK GENERATOR ─────────────────────────────────────────────
 
-function generateToolBlock(tool: MCPToolSchema): string {
+export function generateToolBlock(tool: MCPToolSchema): string {
   const zodParams = tool.parameters
     .map(p => `    ${p.name}: ${zodField(p)}`)
     .join(",\n");
@@ -129,15 +129,17 @@ export function generateServerFile(tools: MCPToolSchema[]): string {
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const server = new McpServer({
+export const server = new McpServer({
   name: "rocketchat-minimal",
   version: "1.0.0",
 });
 ${toolBlocks}
 
 // ── Start server ──────────────────────────────────────────────────────────────
-const transport = new StdioServerTransport();
-await server.connect(transport);
+if (process.env.NODE_ENV !== "test") {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
 `;
 }
 

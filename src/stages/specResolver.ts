@@ -308,6 +308,14 @@ function deriveFriendlyName(operationId: string): string {
 function fuzzyMatch(requested: string, index: Record<string, any>): any | null {
     const lower = requested.toLowerCase().trim();
 
+    // 0. Direct httpPath match — most reliable for dot-notation names
+    // "channels.invite" → "/api/v1/channels.invite"
+    for (const entry of Object.values(index)) {
+        if (entry.httpPath === `/api/v1/${lower}`) {
+            return entry;
+        }
+    }
+
     // 1. Exact operationId match
     if (index[requested]) return index[requested];
 

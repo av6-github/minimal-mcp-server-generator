@@ -1,29 +1,44 @@
-description = "Generate a minimal Rocket.Chat MCP server"
+description = "Generate a minimal Rocket.Chat MCP server — API mode or Workflow mode"
 
 prompt = """
 The user wants to generate a minimal Rocket.Chat MCP server.
 
 Their request: {{args}}
 
-STRICT FLOW — follow this exactly, do not skip or combine steps:
+DETECT MODE:
+- MODE 2 if the request contains ANY of:
+  "if", "when", "based on", "that", "which", "who", "containing",
+  "all users", "every", "each", "loop", "iterate", "filter",
+  "onboard", "archive", "broadcast", "notify", "cleanup", "moderate"
+  OR describes a conditional/iterative action
+- MODE 1 only if the request is explicitly a list of API names
+  (e.g. "sendMessage, getChannels" or "I need the kick and members APIs")
+- When in doubt → MODE 2
 
-STEP 1 — ANALYZE
-- If the user gave specific API names → call `propose_mcp_server` with those APIs and reasoning
-- If the user described a use case → call `analyze_requirements` first, then `propose_mcp_server`
+MODE 1 FLOW (API names given):
+  STEP 1: Call `propose_mcp_server` with the API names
+  STEP 2: Wait for confirmation (add/remove/confirm)
+  STEP 3: Call `ask_server_name` and wait
+  STEP 4: Call `generate_mcp_server` with apis list and serverName
 
-STEP 2 — WAIT FOR CONFIRMATION
-- After propose_mcp_server runs, STOP and wait for the user to respond
-- If user says "add X": update list and call propose_mcp_server again with full updated list
-- If user says "remove X": update list and call propose_mcp_server again with full updated list
-- Only proceed to STEP 3 when user confirms the list with "confirm", "yes", "looks good", or similar
+MODE 2 FLOW (workflow description given):
+  STEP 1: Call `decompose_workflow` with the requirement
+  STEP 2: Wait for confirmation (confirm/adjust/custom)
+  STEP 3: Call `ask_server_name` and wait
+  STEP 4: Call `generate_mcp_server` with:
+    - workflowDefinition: JSON.stringify the confirmed workflow tools array
+    - serverName: the name from step 3
+    - DO NOT pass apis parameter in Mode 2
+    - The workflowDefinition must be a JSON string of the WorkflowTool array
 
-STEP 3 — ASK FOR NAME
-- Call `ask_server_name` with a suggested name derived from the use case
-- STOP and wait for the user to respond with a name
-- If user says "use suggested": use the suggested name
-- Otherwise use whatever name they typed
+CRITICAL for Mode 2:
+- The workflow tools from decompose_workflow must be serialized as JSON
+- Pass workflowDefinition, NOT apis
+- This triggers composite function generation — one tool per workflow, not one tool per API
+- The generated tool will internally chain all the API calls
 
-STEP 4 — GENERATE
-- Call generate_mcp_server with the confirmed API list and the serverName from STEP 3
-- Report token savings table and next steps
+RULES:
+- Never skip the confirmation step
+- Never call generate_mcp_server before the user confirms
+- Always report token savings and runtime benefit
 """
