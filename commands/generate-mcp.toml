@@ -5,15 +5,37 @@ The user wants to generate a minimal Rocket.Chat MCP server.
 
 Their request: {{args}}
 
+## CRITICAL: Mode Detection — Read Before Routing
+
+Route to MODE 1 (call generate_mcp_server directly with apis array) when:
+- Developer lists independent capabilities: "send AND follow messages", "create channels AND invite users"
+- Developer uses "be able to", "let me", "I want to X and Y independently"  
+- Developer provides explicit API names
+- No sequential dependency between requested actions
+
+Route to MODE 2 (call decompose_workflow first) when:
+- Single compound action that HIDES internal complexity: "onboard a user", "follow all messages from a user"
+- Clear sequential dependency: step 2 needs output from step 1
+- Developer uses "automatically", "workflow", "process"
+
+EXAMPLES:
+"send and follow messages" → MODE 1 → apis: ["postMessage", "followMessage"]
+"onboard a new user" → MODE 2 → decompose_workflow
+"get channel history and follow all messages from a user" → MODE 2
+"send messages, get channel info, list users" → MODE 1
+"kick users whose username contains a word" → MODE 2
+
+When in doubt and request contains "and" between two distinct actions → MODE 1.
+
 DETECT MODE:
-- MODE 2 if the request contains ANY of:
+- MODE 1 if the request lists independent capabilities joined by "and", "or", "also",
+  or the developer provides explicit API names, or uses "be able to" / "let me"
+- MODE 2 if the request describes a SINGLE compound action with sequential dependencies,
+  uses "then"/"after"/"followed by", or matches known workflow keywords:
+  "onboard", "archive", "broadcast", "notify", "cleanup", "moderate",
   "if", "when", "based on", "that", "which", "who", "containing",
-  "all users", "every", "each", "loop", "iterate", "filter",
-  "onboard", "archive", "broadcast", "notify", "cleanup", "moderate"
-  OR describes a conditional/iterative action
-- MODE 1 only if the request is explicitly a list of API names
-  (e.g. "sendMessage, getChannels" or "I need the kick and members APIs")
-- When in doubt → MODE 2
+  "all users", "every", "each", "loop", "iterate", "filter"
+- When in doubt and the request contains "and" between two distinct actions → MODE 1
 
 MODE 1 FLOW (API names given):
   STEP 1: Call `propose_mcp_server` with the API names
@@ -22,23 +44,57 @@ MODE 1 FLOW (API names given):
   STEP 4: Call `generate_mcp_server` with apis list and serverName
 
 MODE 2 FLOW (workflow description given):
-  STEP 1: Call `decompose_workflow` with the requirement
-  STEP 2: Wait for confirmation (confirm/adjust/custom)
-  STEP 3: Call `ask_server_name` and wait
-  STEP 4: Call `generate_mcp_server` with:
-    - workflowDefinition: JSON.stringify the confirmed workflow tools array
-    - serverName: the name from step 3
-    - DO NOT pass apis parameter in Mode 2
-    - The workflowDefinition must be a JSON string of the WorkflowTool array
+  STEP 1: Call decompose_workflow with the requirement
+  
+  IF decompose_workflow returns a template match (0 tokens):
+    STEP 2: Show the proposed workflow to the user and ask "confirm/adjust/custom"
+    STEP 3: Call ask_server_name and wait
+    STEP 4: Call generate_mcp_server with workflowDefinition JSON and serverName
+  
+  IF decompose_workflow returns "No template found":
+    STEP 2: Using the candidate APIs listed, design the workflow yourself
+            DO NOT call list_rocketchat_apis to verify
+            DO NOT call analyze_requirements
+            The candidates listed ARE the authoritative set — use them directly
+            IMPORTANT: Tool inputs MUST use human-readable names (channelName, username, groupName)
+                       NEVER use raw IDs (roomId, userId, groupId) as user-facing inputs
+                       The generator auto-injects resolver steps for name→ID conversion
+    STEP 3: Present your proposed workflow to the user in this format:
+            Tool name: X
+            Steps: 1. API → purpose, 2. API → purpose, etc.
+            Then ask: "Does this look right? Type confirm/adjust/custom"
+    STEP 4: Call ask_server_name and wait
+    STEP 5: Call generate_mcp_server with workflowDefinition as JSON string
 
-CRITICAL for Mode 2:
-- The workflow tools from decompose_workflow must be serialized as JSON
-- Pass workflowDefinition, NOT apis
-- This triggers composite function generation — one tool per workflow, not one tool per API
-- The generated tool will internally chain all the API calls
+CRITICAL RULES FOR MODE 2 LLM FALLBACK:
+- You already have the candidate APIs from decompose_workflow — do NOT call list_rocketchat_apis
+- Do NOT call analyze_requirements
+- Do NOT call browse_apis_by_tag
+- Do NOT call propose_mcp_server in Mode 2 — it is for Mode 1 only
+- If you know an RC API name that's not in the candidates (e.g. chat.followMessage, 
+  chat.pinMessage), USE IT DIRECTLY — generate_mcp_server resolves all names internally
+- Design the workflow immediately from the candidates + your RC API knowledge
+- Present it to the user and wait for ONE confirmation response
+- Then call ask_server_name, get the name, then generate
+- Maximum tool calls before user confirmation: 1 (decompose_workflow only)
 
 RULES:
 - Never skip the confirmation step
 - Never call generate_mcp_server before the user confirms
 - Always report token savings and runtime benefit
+
+CRITICAL — After ask_server_name, call generate_mcp_server IMMEDIATELY:
+- For template matches: the workflowDefinition is the tools array from 
+  decompose_workflow's output, serialized as JSON
+- Do NOT read any source files to find the definition
+- Do NOT call any other tools before generate_mcp_server
+- The workflow definition was already shown to the user during confirmation
+  — reconstruct it from that output
+
+AFTER CONFIRMATION — TEMPLATE MATCH PATH:
+- The workflowDefinition JSON was already printed by decompose_workflow
+- Copy it EXACTLY into generate_mcp_server
+- Do NOT read any source files
+- Do NOT call any other tools
+- Call generate_mcp_server immediately with that JSON and the server name
 """

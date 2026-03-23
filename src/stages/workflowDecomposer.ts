@@ -285,122 +285,6 @@ export async function decomposeWorkflow(requirement: string): Promise<{
     };
 }
 
-// ─── SMART PARAMETER MAPPING ──────────────────────────────────────────────────
-
-function buildStepParams(
-    step: WorkflowStep,
-    inputs: WorkflowTool["inputs"],
-    api: RCEndpoint
-): string {
-    const inputNames = new Set(inputs.map(i => i.name));
-    const params: Array<[string, string]> = [];
-
-    for (const param of api.parameters) {
-        if (param.in !== "body" && param.in !== "query") continue;
-
-        const n = param.name.toLowerCase();
-
-        // Direct name match — use variable directly
-        if (inputNames.has(param.name)) {
-            params.push([param.name, param.name]);
-            continue;
-        }
-
-        // userId
-        if (n === "userid" || n === "user_id") {
-            if (step.stepNumber > 1) {
-                params.push([param.name, "_step1Result.user?._id"]);
-            } else if (inputNames.has("username")) {
-                params.push([param.name, "username"]);
-            }
-            continue;
-        }
-
-        if (n === "username") {
-            if (inputNames.has("username")) params.push([param.name, "username"]);
-            continue;
-        }
-
-        // messageId
-        if (n === "messageid" || n === "msgid") {
-            if (inputNames.has("messageId")) params.push([param.name, "messageId"]);
-            continue;
-        }
-
-        // roomId — use extracted variable after step 1
-        if (n === "roomid" || n === "room_id" || n === "rid") {
-            if (step.stepNumber > 1) {
-                params.push([param.name, "roomId"]);
-            } else if (inputNames.has("channelName")) {
-                params.push([param.name, "channelName"]);
-            } else if (inputNames.has("roomName")) {
-                params.push([param.name, "roomName"]);
-            }
-            continue;
-        }
-
-        // roomName — ONLY on step 1, never after
-        if (n === "roomname" || n === "room_name") {
-            if (step.stepNumber === 1) {
-                if (inputNames.has("channelName")) {
-                    params.push([param.name, "channelName"]);
-                } else if (inputNames.has("roomName")) {
-                    params.push([param.name, "roomName"]);
-                }
-            }
-            continue;
-        }
-
-        if (n === "name") {
-            if (inputNames.has("newName")) {
-                params.push([param.name, "newName"]);
-            } else if (inputNames.has("groupName")) {
-                params.push([param.name, "groupName"]);
-            } else if (inputNames.has("channelName")) {
-                params.push([param.name, "channelName"]);
-            } else if (inputNames.has("roomName")) {
-                params.push([param.name, "roomName"]);
-            }
-            continue;
-        }
-
-        if (n === "text" || n === "msg" || n === "message") {
-            if (inputNames.has("welcomeMessage")) {
-                params.push([param.name, `welcomeMessage ?? "Welcome to the team!"`]);
-            } else if (inputNames.has("notifyMessage")) {
-                params.push([param.name, `notifyMessage ?? "This channel is being archived."`]);
-            } else if (inputNames.has("message")) {
-                params.push([param.name, "message"]);
-            } else if (inputNames.has("text")) {
-                params.push([param.name, "text"]);
-            }
-            continue;
-        }
-
-        if (n === "channel") {
-            if (inputNames.has("channelName")) {
-                params.push([param.name, "`#${channelName}`"]);
-            } else if (inputNames.has("roomName")) {
-                params.push([param.name, "`#${roomName}`"]);
-            }
-            continue;
-        }
-
-        if (n === "keyword" && inputNames.has("keyword")) {
-            params.push([param.name, "keyword"]);
-            continue;
-        }
-
-        if (param.required) {
-            params.push([param.name, `"" /* TODO: provide ${param.name} */`]);
-        }
-    }
-
-    if (params.length === 0) return "{}";
-    const lines = params.map(([k, v]) => `      ${k}: ${v}`).join(",\n");
-    return `{\n${lines}\n    }`;
-}
-
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 function matchStepToApi(step: WorkflowStep, resolvedApis: RCEndpoint[]): RCEndpoint | undefined {
@@ -412,23 +296,9 @@ function matchStepToApi(step: WorkflowStep, resolvedApis: RCEndpoint[]): RCEndpo
         r.operationId.toLowerCase().includes(apiLower)
     );
 }
-
-function needsRoomIdExtraction(tool: WorkflowTool): boolean {
-    return tool.steps.some(s => {
-        if (s.stepNumber <= 1) return false;
-        const api = matchStepToApi(s, tool.resolvedApis);
-        if (!api) return false;
-        return api.parameters.some(p =>
-            p.name.toLowerCase() === "roomid" ||
-            p.name.toLowerCase() === "rid" ||
-            p.name.toLowerCase() === "room_id"
-        );
-    });
-}
-
 // ─── WORKFLOW CODE GENERATOR ──────────────────────────────────────────────────
-
 export function generateWorkflowToolCode(tool: WorkflowTool): string {
+    console.error(`[codegen] Generating ${tool.name} — resolved APIs: ${tool.resolvedApis.map(a => a.operationId).join(", ") || "NONE — steps will not resolve"}`);
     const zodParams = tool.inputs
         .map(i => {
             let field = i.type === "number" ? "z.number()"
@@ -442,92 +312,121 @@ export function generateWorkflowToolCode(tool: WorkflowTool): string {
         .join(",\n");
 
     const argsList = tool.inputs.map(i => i.name).join(", ");
-    const extractRoomId = needsRoomIdExtraction(tool);
-    const generatedStepNums: number[] = [];
 
-    const stepImplementations = tool.steps.map((step) => {
+    // Build api parameter name lists for each step — used by buildParams at runtime
+    const stepApiParams = tool.steps.map(step => {
+        const api = matchStepToApi(step, tool.resolvedApis);
+        if (!api) return `[]`;
+        const paramNames = api.parameters
+            .filter(p => p.in === "body" || p.in === "query")
+            .map(p => `"${p.name}"`)
+            .join(", ");
+        return `[${paramNames}]`;
+    });
+
+    const stepImplementations = tool.steps.map((step, index) => {
         const api = matchStepToApi(step, tool.resolvedApis);
 
         if (!api) {
             return `    // Step ${step.stepNumber}: ${step.description} (${step.apiName} — not resolved)`;
         }
 
-        generatedStepNums.push(step.stepNumber);
-
-        const roomIdLine = (step.stepNumber === 1 && extractRoomId)
-            ? `\n    const roomId = _step1Result.channel?._id;`
-            : "";
-
-        // ── Iterative step — filter + loop ────────────────────────────────────
+        // ── Iterative step ────────────────────────────────────────────────────
         if (step.iterateOver) {
             const prevStep = step.stepNumber - 1;
             const arrayField = step.iterateOver;
             const filterInput = step.filterBy || "keyword";
-            const filterField = step.filterField || "username";
+            const filterField = step.filterField || "_id";
 
             return `
     // Step ${step.stepNumber}: ${step.description}
-    // Purpose: ${step.purpose}
-    const _${arrayField} = _step${prevStep}Result.${arrayField} || [];
-    const _matching = _${arrayField}.filter((item: any) =>
-      item.${filterField}?.toLowerCase().includes(${filterInput}.toLowerCase())
-    );
+    const _${arrayField} = _results[${prevStep}]?.${arrayField} || [];
+    const _matching = _${arrayField}.filter((item: any) => {
+        const val = item.${filterField};
+        if (typeof val !== "string") return false;
+        return val.toLowerCase().includes(String(_inputs.${filterInput} ?? "").toLowerCase());
+    });
 
     if (_matching.length === 0) {
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({
-          success: true,
-          message: \`No items found matching "\${${filterInput}}"\`,
-          checked: _${arrayField}.length,
-          processed: [],
-        }, null, 2) }],
-      };
+        return {
+            content: [{ type: "text" as const, text: JSON.stringify({
+                success: true,
+                message: \`No items found matching "\${_inputs.${filterInput}}"\`,
+                checked: _${arrayField}.length,
+            }, null, 2) }],
+        };
     }
 
     const _succeeded: string[] = [];
     const _failed: string[] = [];
 
     for (const _item of _matching) {
-      const _iterResult = await _rc("${api.httpPath}", "${api.httpMethod}", {
-        roomId: roomId,
-        userId: _item._id,
-      });
-      if (_iterResult.success) {
-        _succeeded.push(_item.${filterField});
-      } else {
-        _failed.push(_item.${filterField});
-      }
+        const _iterResult = await _rc("${api.httpPath}", "${api.httpMethod}",
+            buildParams(_results, ${step.stepNumber}, _stepApiParams[${index}], _inputs, _item)
+        );
+        if (_iterResult.success !== false && !_iterResult.error) {
+            _succeeded.push(_item.${filterField});
+        } else {
+            _failed.push(_item.${filterField});
+        }
     }
 
-    const _step${step.stepNumber}Result = {
-      success: true,
-      checked: _${arrayField}.length,
-      matched: _matching.length,
-      succeeded: _succeeded,
-      failed: _failed,
+    _results[${step.stepNumber}] = {
+        success: true,
+        checked: _${arrayField}.length,
+        matched: _matching.length,
+        succeeded: _succeeded,
+        failed: _failed,
     };`;
         }
 
-        // ── Standard step — single API call ──────────────────────────────────
-        const params = buildStepParams(step, tool.inputs, api);
+        // ── Standard step ─────────────────────────────────────────────────────
+        const isCreateStep = api.httpPath.includes(".create") || step.apiName.includes(".create");
+        const errorHandling = isCreateStep
+            ? `
+    if (_results[${step.stepNumber}].error && _results[${step.stepNumber}].errorType !== "error-duplicate-channel-name") {
+        return { content: [{ type: "text" as const, text: \`Step ${step.stepNumber} failed: \${_results[${step.stepNumber}].error}\` }], isError: true };
+    }
+    if (_results[${step.stepNumber}].errorType === "error-duplicate-channel-name") {
+        const _roomNameInput = Object.entries(_inputs).find(([k]) =>
+            k.toLowerCase().includes("channel") ||
+            k.toLowerCase().includes("room") ||
+            k.toLowerCase().includes("group")
+        );
+        if (_roomNameInput) {
+            _results[${step.stepNumber}] = await _rc("/api/v1/channels.info", "GET", { roomName: _roomNameInput[1] });
+            if (_results[${step.stepNumber}].error) {
+                return { content: [{ type: "text" as const, text: \`Step ${step.stepNumber} failed: could not find or create channel — \${_results[${step.stepNumber}].error}\` }], isError: true };
+            }
+        }
+    }`
+            : `
+    if (_results[${step.stepNumber}].error) {
+        return { content: [{ type: "text" as const, text: \`Step ${step.stepNumber} failed: \${_results[${step.stepNumber}].error}\` }], isError: true };
+    }`;
 
         return `
     // Step ${step.stepNumber}: ${step.description}
     // Purpose: ${step.purpose}
-    const _step${step.stepNumber}Result = await _rc("${api.httpPath}", "${api.httpMethod}", ${params});
-    if (!_step${step.stepNumber}Result.success) {
-      return { content: [{ type: "text" as const, text: \`Step ${step.stepNumber} failed: \${_step${step.stepNumber}Result.error || JSON.stringify(_step${step.stepNumber}Result)}\` }], isError: true };
-    }${roomIdLine}`;
+    _results[${step.stepNumber}] = await _rc(
+        "${api.httpPath}",
+        "${api.httpMethod}",
+        buildParams(_results, ${step.stepNumber}, _stepApiParams[${index}], _inputs)
+    );${errorHandling}`;
 
     }).join("\n");
 
-    const lastGenerated = generatedStepNums.length > 0
-        ? generatedStepNums[generatedStepNums.length - 1]
-        : null;
+    const inputsObj = tool.inputs
+        .map(i => {
+            if (!i.required && i.type === "string") {
+                return `        ${i.name}: ${i.name} ?? ""`;
+            }
+            return `        ${i.name}: ${i.name}`;
+        })
+        .join(",\n");
 
-    const resultLine = lastGenerated
-        ? `result: _step${lastGenerated}Result,`
-        : `result: { note: "No steps resolved — check API names" },`;
+    const stepApiParamsArray = `[${stepApiParams.join(", ")}]`;
+    const lastStep = tool.steps[tool.steps.length - 1];
 
     return `
 // ── Workflow Tool: ${tool.name} ${"─".repeat(Math.max(0, 45 - tool.name.length))}
@@ -538,15 +437,181 @@ server.tool(
 ${zodParams}
   },
   async ({ ${argsList} }) => {
+    const _results: Record<number, any> = {};
+
+    const _inputs: Record<string, any> = {
+${inputsObj}
+    };
+
+    const _stepApiParams: string[][] = ${stepApiParamsArray};
+
+    function buildParams(
+        results: Record<number, any>,
+        currentStep: number,
+        apiParams: string[],
+        inputs: Record<string, any>,
+        iterItem?: any
+    ): Record<string, any> {
+        const p: Record<string, any> = {};
+
+        // Search from most recent step backwards to handle multi-room workflows
+        const allResults = Object.values(results).reverse();
+
+        const roomResult = allResults.find((r: any) => 
+            r?.channel?._id || r?.group?._id || r?.room?._id || r?.room?.rid
+        );
+        const resolvedRoomId = 
+            roomResult?.channel?._id || 
+            roomResult?.group?._id || 
+            roomResult?.room?._id || 
+            roomResult?.room?.rid;
+
+        const resolvedUserId =
+            allResults.find((r: any) => r?.user?._id)?.user?._id;
+
+        const resolvedMessageId =
+            allResults.find((r: any) => r?.message?._id)?.message?._id;
+
+        for (const paramName of apiParams) {
+            const n = paramName.toLowerCase();
+
+            if (iterItem) {
+                if (n === "mid" || n === "messageid" || n === "message_id") {
+                    p[paramName] = iterItem._id;
+                    continue;
+                }
+                if (n === "userid" || n === "user_id") {
+                    p[paramName] = iterItem.u?._id || iterItem._id;
+                    continue;
+                }
+            }
+
+            if (n === "roomid" || n === "rid" || n === "room_id") {
+                if (resolvedRoomId) {
+                    p[paramName] = resolvedRoomId;
+                } else {
+                    const roomInput = Object.entries(inputs).find(([k]) =>
+                        (k.toLowerCase().includes("room") ||
+                        k.toLowerCase().includes("channel") ||
+                        k.toLowerCase().includes("group")) &&
+                        (k.toLowerCase().includes("id") || k.toLowerCase() === "rid")
+                    );
+                    if (roomInput) p[paramName] = roomInput[1];
+                }
+                continue;
+            }
+
+            if (n === "roomname" || n === "room_name") {
+                const nameInput = Object.entries(inputs).find(([k]) =>
+                    k.toLowerCase().includes("room") ||
+                    k.toLowerCase().includes("channel") ||
+                    k.toLowerCase().includes("group")
+                );
+                if (nameInput) p[paramName] = nameInput[1];
+                continue;
+            }
+
+            if (n === "userid" || n === "user_id") {
+                if (resolvedUserId && currentStep > 1) {
+                    p[paramName] = resolvedUserId;
+                } else if (!resolvedUserId) {
+                    // No userId resolved yet — pass username as alternative identifier
+                    // Many RC APIs (users.info, users.getPresence) accept username OR userId
+                    const usernameInput = Object.entries(inputs).find(([k]) =>
+                        k.toLowerCase() === "username" ||
+                        k.toLowerCase().includes("user")
+                    );
+                    if (usernameInput) {
+                        p["username"] = usernameInput[1];
+                    }
+                }
+                continue;
+            }
+
+            if (n === "username") {
+                const usernameInput = Object.entries(inputs).find(([k]) =>
+                    k.toLowerCase() === "username" ||
+                    k.toLowerCase().includes("user")
+                );
+                if (usernameInput) {
+                    p[paramName] = usernameInput[1];
+                }
+                continue;
+            }
+
+            if (n === "mid" || n === "messageid" || n === "message_id") {
+                if (resolvedMessageId) {
+                    p[paramName] = resolvedMessageId;
+                } else {
+                    const msgInput = Object.entries(inputs).find(([k]) =>
+                        k.toLowerCase().includes("messageid") ||
+                        k.toLowerCase().includes("mid") ||
+                        k.toLowerCase().includes("message_id")
+                    );
+                    if (msgInput) p[paramName] = msgInput[1];
+                }
+                continue;
+            }
+
+            if (n === "text" || n === "msg" || n === "message" || n === "body") {
+                const textInput = Object.entries(inputs).find(([k]) =>
+                    k.toLowerCase().includes("message") ||
+                    k.toLowerCase().includes("text") ||
+                    k.toLowerCase().includes("content") ||
+                    k.toLowerCase().includes("body") ||
+                    k.toLowerCase().includes("reason") ||
+                    k.toLowerCase().includes("explanation")
+                );
+                if (textInput && textInput[1]) {
+                    p[paramName] = textInput[1];
+                } else {
+                    // Auto-generate a contextual default from available inputs
+                    const userInput = Object.entries(inputs).find(([k]) =>
+                        k.toLowerCase().includes("user")
+                    );
+                    const channelInput = Object.entries(inputs).find(([k]) =>
+                        k.toLowerCase().includes("channel") ||
+                        k.toLowerCase().includes("room")
+                    );
+                    const parts: string[] = [];
+                    if (userInput?.[1]) parts.push("@" + userInput[1]);
+                    if (channelInput?.[1]) parts.push("in #" + channelInput[1]);
+                    p[paramName] = parts.length > 0
+                        ? "Welcome " + parts.join(" ") + "!"
+                        : "Hello!";
+                }
+                continue;
+            }
+
+            if (n === "name") {
+                const nameInput = Object.entries(inputs).find(([k]) =>
+                    k.toLowerCase().includes("name") &&
+                    !k.toLowerCase().includes("user")
+                );
+                if (nameInput) p[paramName] = nameInput[1];
+                continue;
+            }
+
+            const directMatch = Object.entries(inputs).find(([k]) =>
+                k.toLowerCase() === n
+            );
+            if (directMatch) {
+                p[paramName] = directMatch[1];
+            }
+        }
+
+        return p;
+    }
+
     ${stepImplementations}
 
     return {
-      content: [{ type: "text" as const, text: JSON.stringify({
-        success: true,
-        workflow: "${tool.name}",
-        steps: ${generatedStepNums.length},
-        ${resultLine}
-      }, null, 2) }],
+        content: [{ type: "text" as const, text: JSON.stringify({
+            success: true,
+            workflow: "${tool.name}",
+            steps: ${tool.steps.length},
+            result: _results[${lastStep?.stepNumber || 1}],
+        }, null, 2) }],
     };
   }
 );`;
@@ -565,9 +630,20 @@ export async function _rc(
   params: Record<string, any> = {}
 ): Promise<any> {
   const isGet = method === "GET";
+
+  // Substitute path parameters like {rid}, {roomId}, {_id} before building URL
+  let resolvedPath = path;
+  const remainingParams = { ...params };
+  for (const [key, value] of Object.entries(params)) {
+    if (resolvedPath.includes(\`{\${key}}\`)) {
+      resolvedPath = resolvedPath.replace(\`{\${key}}\`, String(value));
+      delete remainingParams[key];
+    }
+  }
+
   const url = isGet
-    ? \`\${RC_URL}\${path}?\${new URLSearchParams(params).toString()}\`
-    : \`\${RC_URL}\${path}\`;
+    ? \`\${RC_URL}\${resolvedPath}?\${new URLSearchParams(remainingParams).toString()}\`
+    : \`\${RC_URL}\${resolvedPath}\`;
 
   const res = await fetch(url, {
     method,
@@ -576,7 +652,7 @@ export async function _rc(
       "X-Auth-Token": RC_AUTH_TOKEN,
       "X-User-Id": RC_USER_ID,
     },
-    ...(isGet ? {} : { body: JSON.stringify(params) }),
+    ...(isGet ? {} : { body: JSON.stringify(remainingParams) }),
   });
 
   return res.json();

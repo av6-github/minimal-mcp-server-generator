@@ -150,6 +150,9 @@ export function generatePackageJson(toolCount: number): string {
     name: "rocketchat-minimal-mcp",
     version: "1.0.0",
     description: `Minimal Rocket.Chat MCP server with ${toolCount} tools`,
+    engines: {
+      node: ">=18"
+    },
     type: "module",
     main: "dist/index.js",
     scripts: {

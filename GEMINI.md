@@ -14,6 +14,7 @@ viable within free-tier token budgets.
 - `analyze_requirements` — analyze a plain English use case and suggest the minimal API set
 - `propose_mcp_server` — show the user a proposed API list for confirmation before generating
 - `generate_mcp_server` — generate a minimal MCP server for a confirmed API list
+- `add_api_to_server` — add tools to an already-generated server without regenerating
 
 ## Behavior
 ONLY use these tools when the user explicitly asks to GENERATE or BUILD an MCP server.
@@ -38,3 +39,30 @@ When generating in workflow mode (after decompose_workflow):
 - The generator resolves APIs internally — no verification needed
 - `add_api_to_server` — add tools to an already-generated server without regenerating
 
+## Mode 2 LLM Fallback Rules
+- When decompose_workflow returns "No template found", you already have everything you need
+- The 20 candidate APIs in the response ARE authoritative — do not verify them
+- If you know the correct RC API name for a step (e.g. chat.followMessage, chat.pinMessage),
+  use it directly even if it's not in the candidates — generate_mcp_server resolves all names internally
+- Design the workflow from those candidates + your RC API knowledge immediately
+- Present it to the user and wait for confirmation
+- Do NOT loop back to list_rocketchat_apis, browse_apis_by_tag, or analyze_requirements
+- Do NOT call propose_mcp_server — that tool is Mode 1 only
+
+## Mode Detection — Critical Examples
+
+MODE 1 (separate tools, no decompose_workflow):
+- "send and follow messages" → postMessage + followMessage as separate tools
+- "create a channel and post a message" → channels.create + chat.postMessage as separate tools  
+- "get user info and channel info" → users.info + channels.info as separate tools
+- "I want to send, pin and star messages" → three separate wrapper tools
+
+MODE 2 (composite workflow, use decompose_workflow):
+- "onboard a new user" → single tool that internally chains 4 API calls
+- "follow all messages from a specific user" → single tool that fetches history then iterates
+- "kick users whose username contains a word" → single tool that fetches members then loops
+
+The signal for MODE 1: developer wants independent access to each capability.
+The signal for MODE 2: developer wants a single action that hides the complexity of multiple steps.
+
+When in doubt and the request contains "and" between two distinct actions — use MODE 1.

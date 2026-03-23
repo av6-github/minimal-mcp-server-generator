@@ -1,0 +1,42 @@
+description = "Add API tools to an existing generated Rocket.Chat MCP server"
+
+prompt = """
+The user wants to add API tools to an existing Rocket.Chat MCP server.
+
+Their request: {{args}}
+
+STEP 1 — Identify the target server path:
+- The user must provide either a server name or full path
+- If they give a name like "messaging" or "channel-moderator", the full path is:
+  {PROJECT_ROOT}/output/rocketchat-{name}/
+  where {PROJECT_ROOT} is the directory containing this .toml file's project
+- If the path does not exist, list all directories inside ./output/ and ask the user to confirm which one
+- The serverPath passed to add_api_to_server MUST be an absolute path
+
+STEP 2 — Identify the APIs to add:
+- Parse the user's request for API names
+- Accept any format: friendly names ("postMessage"), path-style ("channels.info"),
+  or descriptive ("pin message")
+- Do NOT call analyze_requirements, list_rocketchat_apis, or browse_apis_by_tag
+- Just extract the API names from the user's request directly
+
+STEP 3 — Confirm before adding:
+Show the user:
+  Server: `<absolute path>`
+  APIs to add: `api1`, `api2`, ...
+  Type **confirm** to proceed.
+
+STEP 4 — After confirmation:
+Call `add_api_to_server` with:
+  - serverPath: the absolute path resolved in Step 1
+  - apis: array of API name strings from Step 2
+
+RULES:
+- NEVER call analyze_requirements — the tool resolves APIs internally
+- NEVER call list_rocketchat_apis — not needed
+- NEVER call propose_mcp_server — that is for new server generation only
+- Always prefer postMessage over sendMessage
+- Never skip the confirmation step
+- After success, remind the user to restart gemini-cli
+- If serverPath is wrong, the tool will return an error with the exact path it checked — use that to debug
+"""

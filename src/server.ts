@@ -10,7 +10,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { execSync } from "child_process";
 import { generatePackageJson, generateTsConfig, generateEnvExample } from "./stages/codeGenerator.js";
-import { decomposeWorkflow, generateWorkflowToolCode, RC_CLIENT_TEMPLATE, type WorkflowTool } from "./stages/workflowDecomposer.js";
+import { decomposeWorkflow, generateWorkflowToolCode, RC_CLIENT_TEMPLATE, type WorkflowTool, type WorkflowStep } from "./stages/workflowDecomposer.js";
 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -308,7 +308,7 @@ The server will be accessible as \`rocketchat-<name>\` in gemini-cli.`,
 
 server.tool(
     "decompose_workflow",
-    "Decompose a plain English workflow description into structured tool definitions. Each tool may internally call multiple RC APIs. Use this for Mode 2 generation when the developer describes a task rather than specific APIs.",
+    "Decompose a SINGLE compound task into a structured workflow where steps have sequential dependencies — output of one step feeds the next. Use ONLY when the requirement describes one action that internally requires multiple chained RC API calls (e.g. 'onboard a user', 'follow all messages from a specific user'). Do NOT use when the developer wants multiple independent capabilities — use generate_mcp_server with apis list instead.",
     {
         requirement: z.string().describe(
             "Plain English description of the workflow e.g. 'onboard new team members' or 'archive inactive channels and notify users'"
@@ -336,6 +336,9 @@ ${inputList}
 ${stepList}`;
             }).join("\n\n");
 
+            // Pre-serialize the workflowDefinition so Gemini never needs to read source files
+            const workflowDefinitionJSON = JSON.stringify(definition.tools);
+
             return {
                 content: [{
                     type: "text",
@@ -352,16 +355,29 @@ Does this workflow match what you need?
 - ✅ Type **"confirm"** to generate this workflow server
 - ✏️  Type **"adjust step X"** to modify a specific step
 - ➕ Type **"add step"** to add another step to the workflow
-- 🔄 Type **"custom"** if this doesn't match — I'll analyze your requirement with the LLM`,
+- 🔄 Type **"custom"** if this doesn't match — I'll analyze your requirement with the LLM
+
+---
+⚡ **When confirmed, call \`generate_mcp_server\` with EXACTLY this — do NOT read any files:**
+\`\`\`
+workflowDefinition: ${workflowDefinitionJSON}
+\`\`\``,
                 }],
             };
         }
 
-        // LLM fallback — return catalogue and let gemini reason
+        // LLM fallback — return rich catalogue with full parameter descriptions
         const { candidates } = findCandidateApis(requirement);
-        const catalogue = candidates
-            .map(a => `${a.friendlyName} | ${a.summary} | ${a.httpMethod} ${a.httpPath}`)
-            .join("\n");
+        const resolvedCandidates = resolveApis(candidates.map(c => c.operationId)).resolved;
+
+        const catalogue = resolvedCandidates
+            .map(a => {
+                const params = a.parameters
+                    .map(p => `  - ${p.name} (${p.required ? "required" : "optional"}): ${p.description}`)
+                    .join("\\n");
+                return `API: ${a.friendlyName} | ${a.httpMethod} ${a.httpPath}\\nSummary: ${a.summary}\\nParameters:\\n${params || "  (None)"}\\n`;
+            })
+            .join("\\n");
 
         return {
             content: [{
@@ -378,8 +394,13 @@ ${catalogue}
 **Your task:** Design a workflow tool for this requirement.
 1. Define the tool name and description
 2. Define the minimal high-level inputs (hide implementation details)
-3. Break it into ordered steps, each mapping to one RC API above
+3. Break it into ordered steps, each mapping to one RC API
 4. Then call \`generate_mcp_server\` with the workflow definition
+
+**⚠️ CRITICAL: Do NOT call list_rocketchat_apis, browse_apis_by_tag, or analyze_requirements.**
+**Use the candidates above as your primary set. If you know the correct RC API name**
+**for a step (e.g. chat.followMessage, chat.pinMessage), use it directly even if it**
+**is not in the candidates — generate_mcp_server resolves all API names internally.**
 
 **Output format:**
 \`\`\`json
@@ -424,6 +445,12 @@ ${catalogue}
 ]
 \`\`\`
 
+**Rules for tool inputs:**
+- ALWAYS use human-readable names: channelName, username, groupName
+- NEVER use raw IDs as user-facing inputs: roomId, userId, groupId
+- The generator auto-injects resolver steps (e.g. channels.info) when it detects name→ID gaps
+- Users should never need to look up IDs manually
+
 **Rules for iterateOver:**
 - Set \`iterateOver\` to the array field name from the PREVIOUS step's result when this step must loop (e.g. "members" from channels.members result, "messages" from channels.history result)
 - Set \`filterBy\` to the tool input name used as the filter value (e.g. "keyword", "daysOld")
@@ -431,7 +458,9 @@ ${catalogue}
 - Set all three to null for single-call steps
 - Use iterateOver whenever the step says "each", "all", "every", "loop", "for each", "filter and"
 
-**The workflowDefinition passed to generate_mcp_server must be JSON.stringify() of this array.**`,
+**⚡ When you have designed the workflow, call \`generate_mcp_server\` immediately with your JSON — do NOT read any source files.**
+**⚡ Do NOT call list_rocketchat_apis or any other tool — go straight to generate_mcp_server.**
+**The workflowDefinition passed to generate_mcp_server must be JSON.stringify() of the array above.**`,
             }],
         };
     }
@@ -498,8 +527,180 @@ server.tool(
                 };
             });
 
+            // ── Pre-generation enrichment ─────────────────────────────────────
+            // Detect missing prerequisite steps and inject them automatically
+            // e.g. if step 1 needs roomId but tool inputs only have channelName,
+            // inject channels.info as a new step 1 and renumber everything
+
+            function enrichWorkflowWithPrerequisites(tool: WorkflowTool): WorkflowTool {
+                let enrichedTool = { ...tool };
+                const inputNames = new Set(tool.inputs.map(i => i.name.toLowerCase()));
+
+                // ── Gap 1: API needs roomId but input is channelName ──────────
+                const anyStepNeedsRoomId = enrichedTool.resolvedApis.some(api =>
+                    api.parameters.some(p =>
+                        p.name.toLowerCase() === "roomid" ||
+                        p.name.toLowerCase() === "rid"
+                    )
+                );
+
+                const hasChannelName = inputNames.has("channelname") ||
+                    inputNames.has("roomname") ||
+                    inputNames.has("channelid");
+                const hasRoomId = inputNames.has("roomid") || inputNames.has("rid");
+
+                const alreadyHasChannelInfo = enrichedTool.steps.some(s =>
+                    s.apiName.toLowerCase().includes("channels.info") ||
+                    s.apiName.toLowerCase().includes("channels.create") ||
+                    s.apiName.toLowerCase().includes("groups.info") ||
+                    s.apiName.toLowerCase().includes("rooms.info")
+                );
+
+                if (anyStepNeedsRoomId && hasChannelName && !hasRoomId && !alreadyHasChannelInfo) {
+                    const { resolved } = resolveApis(["channels.info"]);
+
+                    const injectedStep: WorkflowStep = {
+                        stepNumber: 1,
+                        description: "Resolve channel name to room ID",
+                        apiName: "channels.info",
+                        purpose: "Get the roomId required by subsequent steps",
+                    };
+
+                    const renumberedSteps = enrichedTool.steps.map(s => ({
+                        ...s,
+                        stepNumber: s.stepNumber + 1,
+                    }));
+
+                    const inputsWithChannelName = enrichedTool.inputs.some(i =>
+                        i.name.toLowerCase().includes("channel") ||
+                        i.name.toLowerCase().includes("room")
+                    ) ? enrichedTool.inputs : [
+                        {
+                            name: "channelName",
+                            type: "string",
+                            required: true,
+                            description: "The name of the channel",
+                        },
+                        ...enrichedTool.inputs,
+                    ];
+
+                    enrichedTool = {
+                        ...enrichedTool,
+                        inputs: inputsWithChannelName,
+                        steps: [injectedStep, ...renumberedSteps],
+                        resolvedApis: [...resolved, ...enrichedTool.resolvedApis],
+                    };
+                }
+
+                // ── Gap 2: API needs userId but input is username ─────────────
+                const anyStepNeedsUserId = enrichedTool.resolvedApis.some(api =>
+                    api.parameters.some(p =>
+                        p.name.toLowerCase() === "userid" ||
+                        p.name.toLowerCase() === "user_id"
+                    )
+                );
+
+                const hasUsername = inputNames.has("username") || inputNames.has("user");
+                const hasUserId = inputNames.has("userid") || inputNames.has("user_id");
+
+                const alreadyHasUsersInfo = enrichedTool.steps.some(s =>
+                    s.apiName.toLowerCase().includes("users.info")
+                );
+
+                if (anyStepNeedsUserId && hasUsername && !hasUserId && !alreadyHasUsersInfo) {
+                    const { resolved: usersInfoResolved } = resolveApis(["users.info"]);
+
+                    const nextStepNumber = enrichedTool.steps.length > 0
+                        ? Math.min(...enrichedTool.steps.map(s => s.stepNumber))
+                        : 1;
+
+                    const injectedUserStep: WorkflowStep = {
+                        stepNumber: nextStepNumber,
+                        description: "Resolve username to user ID",
+                        apiName: "users.info",
+                        purpose: "Get the userId required by subsequent steps",
+                    };
+
+                    const renumberedAgain = enrichedTool.steps.map(s => ({
+                        ...s,
+                        stepNumber: s.stepNumber + 1,
+                    }));
+
+                    enrichedTool = {
+                        ...enrichedTool,
+                        steps: [injectedUserStep, ...renumberedAgain],
+                        resolvedApis: [...usersInfoResolved, ...enrichedTool.resolvedApis],
+                    };
+                }
+
+                // ── Gap 3: API needs groupId but input is groupName ───────────
+                const anyStepNeedsGroupId = enrichedTool.resolvedApis.some(api =>
+                    api.parameters.some(p =>
+                        p.name.toLowerCase() === "groupid"
+                    )
+                );
+
+                const hasGroupName = inputNames.has("groupname") || inputNames.has("group");
+                const hasGroupId = inputNames.has("groupid");
+
+                const alreadyHasGroupsInfo = enrichedTool.steps.some(s =>
+                    s.apiName.toLowerCase().includes("groups.info") ||
+                    s.apiName.toLowerCase().includes("groups.create")
+                );
+
+                if (anyStepNeedsGroupId && hasGroupName && !hasGroupId && !alreadyHasGroupsInfo) {
+                    const { resolved: groupsInfoResolved } = resolveApis(["groups.info"]);
+
+                    const nextStepNumber = enrichedTool.steps.length > 0
+                        ? Math.min(...enrichedTool.steps.map(s => s.stepNumber))
+                        : 1;
+
+                    const injectedGroupStep: WorkflowStep = {
+                        stepNumber: nextStepNumber,
+                        description: "Resolve group name to group ID",
+                        apiName: "groups.info",
+                        purpose: "Get the groupId required by subsequent steps",
+                    };
+
+                    const renumberedForGroup = enrichedTool.steps.map(s => ({
+                        ...s,
+                        stepNumber: s.stepNumber + 1,
+                    }));
+
+                    enrichedTool = {
+                        ...enrichedTool,
+                        steps: [injectedGroupStep, ...renumberedForGroup],
+                        resolvedApis: [...groupsInfoResolved, ...enrichedTool.resolvedApis],
+                    };
+                }
+
+                // ── Gap 4: API needs messageId but input is messageText ───────
+                // Cannot auto-resolve — surface a warning
+                const anyStepNeedsMessageId = enrichedTool.resolvedApis.some(api =>
+                    api.parameters.some(p =>
+                        p.name.toLowerCase() === "messageid" ||
+                        p.name.toLowerCase() === "mid" ||
+                        p.name.toLowerCase() === "message_id"
+                    )
+                );
+
+                const hasMessageText = inputNames.has("messagetext") || inputNames.has("message");
+                const hasMessageId = inputNames.has("messageid") || inputNames.has("mid") || inputNames.has("message_id");
+
+                if (anyStepNeedsMessageId && hasMessageText && !hasMessageId) {
+                    console.error(
+                        `[enrichment] ⚠️ Tool "${enrichedTool.name}" has steps needing messageId but only messageText is provided. ` +
+                        `Cannot auto-resolve — the developer must provide a messageId input.`
+                    );
+                }
+
+                return enrichedTool;
+            }
+
+            const enrichedWithPrereqs = enrichedWorkflowTools.map(enrichWorkflowWithPrerequisites);
+
             // Generate composite workflow tool code
-            const workflowToolCode = enrichedWorkflowTools
+            const workflowToolCode = enrichedWithPrereqs
                 .map(t => generateWorkflowToolCode(t))
                 .join("\n");
 
@@ -688,48 +889,13 @@ server.tool(
         const { candidates, matchedKeywords, coverage } = result;
         const allApis = listAllApis();
 
-        // Fallback to category-based filtering if keyword coverage is too low
-        let finalCandidates = candidates;
-        let fallbackUsed = false;
+        // Use BM25 candidates directly — subsystem penalty already handled in findCandidateApis
+        // No platform-specific fallback needed
+        const finalCandidates = candidates.length >= 3
+            ? candidates
+            : listAllApis().slice(0, 20); // absolute last resort — should never happen with BM25
 
-        if (coverage < 30 || candidates.length < 3) {
-            const categoryKeywords: Record<string, string[]> = {
-                "messaging": ["message", "chat", "send", "post", "reply", "thread", "mention", "pin", "star"],
-                "rooms": ["channel", "room", "group", "create", "join", "leave", "archive", "rename", "topic"],
-                "user-management": ["user", "profile", "account", "member", "role", "permission", "status"],
-                "authentication": ["login", "auth", "authentication", "token", "oauth", "password", "session", "2fa", "credentials", "signin", "signup"],
-                "omnichannel": ["livechat", "visitor", "agent", "omnichannel", "support", "ticket", "department"],
-                "integrations": ["webhook", "integration", "trigger", "incoming", "outgoing"],
-                "notifications": ["notification", "push", "alert", "subscribe", "email"],
-                "settings": ["setting", "config", "workspace", "admin", "preference"],
-            };
-
-            const reqLower = requirements.toLowerCase();
-            const matchedCategories: string[] = [];
-
-            for (const [cat, keywords] of Object.entries(categoryKeywords)) {
-                if (keywords.some(k => reqLower.includes(k))) {
-                    matchedCategories.push(cat);
-                }
-            }
-
-            if (matchedCategories.length > 0) {
-                finalCandidates = allApis
-                    .filter(a => matchedCategories.some(cat => a.sourceFile.includes(cat)))
-                    .slice(0, 20);
-                fallbackUsed = true;
-            } else {
-                finalCandidates = allApis
-                    .filter(a => a.sourceFile.includes("messaging") || a.sourceFile.includes("rooms"))
-                    .slice(0, 20);
-                fallbackUsed = true;
-            }
-        }
-
-        // Build tag groups — MUST come after finalCandidates is resolved
-        const tagGroups = fallbackUsed
-            ? buildTagGroupsFromCandidates(finalCandidates)
-            : result.tagGroups;
+        const tagGroups = result.tagGroups;
 
         // Build tag-grouped catalogue
         const tagGroupedLines: string[] = [];
@@ -765,9 +931,7 @@ server.tool(
         const tokensAfter = finalCandidates.length * 15;
         const tokensSaved = tokensBefore - tokensAfter;
 
-        const filterMethod = fallbackUsed
-            ? `category-based fallback (keyword coverage was ${coverage}%)`
-            : `keyword matching (${coverage}% coverage)`;
+        const filterMethod = `BM25 ranking (${coverage}% keyword coverage)`;
 
         // Build pre-selected suggestion
         const ambiguousNames = new Set(["delete", "create", "list", "info", "update",
@@ -841,14 +1005,15 @@ server.tool(
     },
     async ({ serverPath, apis }) => {
         // Verify server exists
-        if (!existsSync(join(serverPath, "src/index.ts"))) {
+        const indexPath = join(serverPath, "src/index.ts");
+        if (!existsSync(indexPath)) {
             return {
                 content: [{ type: "text", text: `❌ No generated server found at ${serverPath}. Check the path.` }],
                 isError: true,
             };
         }
 
-        // Resolve the new APIs
+        // Resolve the new APIs using the same resolver as the main process
         const { resolved, notFound } = resolveApis(apis);
         if (resolved.length === 0) {
             return {
@@ -860,13 +1025,31 @@ server.tool(
         // Map to MCP schemas
         const newTools = resolved.map(mapToMCPSchema);
 
-        // Read existing index.ts
-        const indexPath = join(serverPath, "src/index.ts");
+        // Read existing index.ts and check for duplicates
         let existing = readFileSync(indexPath, "utf-8");
 
-        // Generate code for each new tool
+        const duplicates: string[] = [];
+        const uniqueTools = newTools.filter(t => {
+            // Check if tool is already defined in the server file
+            if (existing.includes(`"${t.name}"`) || existing.includes(`'${t.name}'`)) {
+                duplicates.push(t.name);
+                return false;
+            }
+            return true;
+        });
+
+        if (uniqueTools.length === 0) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `⚠️ All requested tools already exist in the server:\n${duplicates.map(d => `  - \`${d}\``).join("\n")}\n\nNo changes made.`,
+                }],
+            };
+        }
+
+        // Generate code for each new tool (using the same codeGenerator as main process)
         const { generateToolBlock } = await import("./stages/codeGenerator.js");
-        const newToolCode = newTools.map(t => generateToolBlock(t)).join("\n");
+        const newToolCode = uniqueTools.map(t => generateToolBlock(t)).join("\n");
 
         // Inject before the server startup line
         const insertBefore = "// ── Start server";
@@ -874,17 +1057,25 @@ server.tool(
             existing = existing.replace(insertBefore, `${newToolCode}\n\n${insertBefore}`);
         } else {
             // Fallback — inject before connect line
-            existing = existing.replace(
-                "await server.connect(transport);",
-                `${newToolCode}\n\nawait server.connect(transport);`
-            );
+            // Try workflow server pattern first
+            if (existing.includes("const transport = new StdioServerTransport();")) {
+                existing = existing.replace(
+                    "const transport = new StdioServerTransport();",
+                    `${newToolCode}\n\nconst transport = new StdioServerTransport();`
+                );
+            } else {
+                existing = existing.replace(
+                    "await server.connect(transport);",
+                    `${newToolCode}\n\nawait server.connect(transport);`
+                );
+            }
         }
 
         writeFileSync(indexPath, existing);
 
         // Generate test files for new tools
         const { generateTestFile } = await import("./stages/testGenerator.js");
-        for (const tool of newTools) {
+        for (const tool of uniqueTools) {
             const testPath = join(serverPath, `src/tests/${tool.name}.test.ts`);
             if (!existsSync(testPath)) {
                 writeFileSync(testPath, generateTestFile(tool));
@@ -903,12 +1094,14 @@ server.tool(
             };
         }
 
-        const toolList = newTools.map(t =>
+        const toolList = uniqueTools.map(t =>
             `  - \`${t.name}\`: ${t.description}`
         ).join("\n");
 
-        const warnings = notFound.length > 0
-            ? `\n⚠️ Not found (skipped): ${notFound.join(", ")}` : "";
+        const warnings: string[] = [];
+        if (notFound.length > 0) warnings.push(`⚠️ Not found (skipped): ${notFound.join(", ")}`);
+        if (duplicates.length > 0) warnings.push(`ℹ️ Already existed (skipped): ${duplicates.join(", ")}`);
+        const warningBlock = warnings.length > 0 ? `\n${warnings.join("\n")}` : "";
 
         return {
             content: [{
@@ -917,12 +1110,12 @@ server.tool(
 
 **Server:** \`${serverPath}\`
 
-**Added (${newTools.length}):**
+**Added (${uniqueTools.length}):**
 ${toolList}
 
 **Rebuilt successfully.**
 ⚠️ Restart gemini-cli to load the updated tools into your session.
-${warnings}`,
+${warningBlock}`,
             }],
         };
     }

@@ -1,175 +1,16 @@
-import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
-import yaml from "js-yaml";
 import type { RCEndpoint, RCParameter } from "./types.js";
-import SwaggerParser from "@apidevtools/swagger-parser";
+import { rcAdapter } from "./rcAdapter.js";
+import BM25 from "wink-bm25-text-search";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SPECS_DIR = join(__dirname, "../specs");
-
-const RC_OPENAPI_REPO = "https://raw.githubusercontent.com/RocketChat/Rocket.Chat-Open-API/main";
-
-const CACHE_DIR = join(__dirname, "../specs-cache");
-const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-const SPEC_FILES = [
-    "authentication.yaml",
-    "content-management.yaml",
-    "integrations.yaml",
-    "marketplace-apps.yaml",
-    "messaging.yaml",
-    "miscellaneous.yaml",
-    "notifications.yaml",
-    "omnichannel.yaml",
-    "rooms.yaml",
-    "settings.yaml",
-    "statistics.yaml",
-    "user-management.yaml",
-];
-
-// ─── LOAD AND PARSE ALL YAML SPEC FILES ──────────────────────────────────────
-
-// ─── CACHE HELPERS ────────────────────────────────────────────────────────────
-
-function getCachePath(filename: string): string {
-    return join(CACHE_DIR, filename);
-}
-
-function isCacheValid(filename: string): boolean {
-    const cachePath = getCachePath(filename);
-    if (!existsSync(cachePath)) return false;
-    try {
-        const stats = require("fs").statSync(cachePath);
-        return (Date.now() - stats.mtimeMs) < CACHE_MAX_AGE_MS;
-    } catch {
-        return false;
-    }
-}
-
-function readFromCache(filename: string): string {
-    return readFileSync(getCachePath(filename), "utf-8");
-}
-
-function writeToCache(filename: string, content: string): void {
-    try {
-        mkdirSync(CACHE_DIR, { recursive: true });
-        writeFileSync(getCachePath(filename), content, "utf-8");
-    } catch {
-        // Cache write failure is non-fatal
-    }
-}
-
-// ─── GITHUB FETCHER ───────────────────────────────────────────────────────────
-
-async function fetchSpecFromGitHub(filename: string): Promise<string> {
-    const url = `${RC_OPENAPI_REPO}/${filename}`;
-
-    const headers: Record<string, string> = {
-        "Accept": "application/vnd.github.raw+json",
-        "User-Agent": "gemini-rocketchat-mcp-generator",
-    };
-
-    // Use PAT if provided — avoids rate limits (60 req/hr unauthenticated vs 5000/hr with PAT)
-    const pat = process.env.GITHUB_PAT || process.env.GITHUB_TOKEN;
-    if (pat) {
-        headers["Authorization"] = `Bearer ${pat}`;
-    }
-
-    const response = await fetch(url, { headers });
-
-    if (response.status === 403) {
-        const remaining = response.headers.get("x-ratelimit-remaining");
-        const reset = response.headers.get("x-ratelimit-reset");
-        const resetTime = reset
-            ? new Date(parseInt(reset) * 1000).toLocaleTimeString()
-            : "unknown";
-        throw new Error(
-            `GitHub rate limit hit. Remaining: ${remaining ?? "0"}. ` +
-            `Resets at: ${resetTime}. ` +
-            `Set GITHUB_PAT env var to avoid rate limits.`
-        );
-    }
-
-    if (response.status === 401) {
-        throw new Error("GitHub PAT is invalid or expired. Check your GITHUB_PAT env var.");
-    }
-
-    if (!response.ok) {
-        throw new Error(`GitHub fetch failed for ${filename}: HTTP ${response.status}`);
-    }
-
-    return response.text();
-}
-
-// ─── SPEC LOADER ──────────────────────────────────────────────────────────────
-
-async function loadSpecContent(filename: string): Promise<string> {
-    const forceLocal = process.env.FORCE_LOCAL_SPECS === "true";
-
-    // 1. Force local mode
-    if (forceLocal) {
-        return readFileSync(join(SPECS_DIR, filename), "utf-8");
-    }
-
-    // 2. Valid cache exists — use it
-    if (isCacheValid(filename)) {
-        return readFromCache(filename);
-    }
-
-    // 3. Try GitHub (with PAT if available)
-    try {
-        const content = await fetchSpecFromGitHub(filename);
-        writeToCache(filename, content); // cache for next time
-        return content;
-    } catch (githubError: any) {
-        const isRateLimit = githubError.message?.includes("rate limit");
-
-        // 4. Rate limited — try stale cache before falling back to bundled
-        if (isRateLimit && existsSync(getCachePath(filename))) {
-            console.error(`[specs] Rate limited — using stale cache for ${filename}`);
-            return readFromCache(filename);
-        }
-
-        // 5. Any other error — fall back to bundled local spec
-        console.error(`[specs] GitHub fetch failed for ${filename}, using local: ${githubError.message}`);
-        return readFileSync(join(SPECS_DIR, filename), "utf-8");
-    }
-}
+// ─── SPEC LOADER (via platform adapter) ───────────────────────────────────────
 
 async function loadAllSpecs(): Promise<Record<string, any>> {
     const allPaths: Record<string, any> = {};
 
-    // Load all spec files in parallel for speed
-    const results = await Promise.allSettled(
-        SPEC_FILES.map(async (file) => {
-            const content = await loadSpecContent(file);
-            return { file, content };
-        })
-    );
+    // Load specs via platform adapter
+    const allSpecs = await rcAdapter.loadSpec();
 
-    for (const result of results) {
-        if (result.status === "rejected") {
-            console.error(`[specs] Failed to load a spec file:`, result.reason);
-            continue;
-        }
-
-        const { file, content } = result.value;
-
-        let parsed: any;
-        try {
-            // First parse the YAML
-            const rawParsed = yaml.load(content) as any;
-
-            // Then fully dereference all $refs — this resolves nested schema
-            // references, shared component definitions, and complex allOf/oneOf/anyOf
-            // that our manual resolver missed
-            parsed = await SwaggerParser.dereference(rawParsed as any);
-        } catch (e) {
-            console.error(`[specs] Failed to parse/dereference ${file}:`, e);
-            continue;
-        }
-
+    for (const { file, spec: parsed } of allSpecs) {
         if (!parsed?.paths) continue;
 
         for (const [path, methods] of Object.entries(parsed.paths) as any) {
@@ -398,78 +239,49 @@ function getIndex(): Record<string, any> {
 }
 
 
-// ─── KEYWORD INDEX ────────────────────────────────────────────────────────────
-// Built once at startup, used to narrow candidates before LLM reasoning
+// ─── BM25 INDEX ───────────────────────────────────────────────────────────────
+// Replaces keyword + synonym scoring with BM25F for relevance-ranked search
 
-interface KeywordIndex {
-    keywords: Record<string, string[]>; // keyword → list of operationIds
-    categories: Record<string, string[]>; // category → list of operationIds
-}
 
-let _keywordIndex: KeywordIndex | null = null;
 
-function buildKeywordIndex(): KeywordIndex {
+let _bm25: any = null;
+
+function buildBM25Index(): any {
     const index = getIndex();
-    const keywords: Record<string, string[]> = {};
-    const categories: Record<string, string[]> = {};
+    const engine = BM25();
 
-    for (const entry of Object.values(index) as any) {
-        const category = entry.sourceFile.replace(".yaml", "").replace(/-/g, " ");
-        const tagsText = (entry.tags || []).join(" ");
-        const descSnippet = (entry.description || "").slice(0, 200); // first 200 chars
-        const text = `${entry.summary} ${entry.description ? descSnippet : ""} ${entry.httpPath} ${entry.operationId} ${category} ${tagsText}`.toLowerCase();
-
-        // Extract meaningful words (ignore short/common words)
-        const stopWords = new Set(["the", "a", "an", "to", "of", "in", "for",
-            "and", "or", "by", "get", "set", "api", "v1", "with", "from"]);
-
-        const words = text
-            .replace(/[^a-z0-9\s]/g, " ")
-            .split(/\s+/)
-            .filter(w => w.length > 3 && !stopWords.has(w));
-
-        for (const word of words) {
-            if (!keywords[word]) keywords[word] = [];
-            if (!keywords[word].includes(entry.operationId)) {
-                keywords[word].push(entry.operationId);
-            }
+    engine.defineConfig({
+        fldWeights: {
+            operationId: 2,
+            summary: 3,
+            httpPath: 2,
+            tags: 1,
         }
+    });
 
-        // Index by category
-        const cat = entry.sourceFile.replace(".yaml", "");
-        if (!categories[cat]) categories[cat] = [];
-        categories[cat].push(entry.operationId);
+    engine.definePrepTasks([
+        (text: string) => text.toLowerCase(),
+        (text: string) => text.replace(/[^a-z0-9\s]/g, " "),
+        (text: string) => text.split(/\s+/),
+    ]);
+
+    for (const entry of Object.values(index) as any[]) {
+        engine.addDoc({
+            operationId: entry.operationId,
+            summary: entry.summary || "",
+            httpPath: entry.httpPath,
+            tags: (entry.tags || []).join(" "),
+        }, entry.operationId);
     }
 
-    return { keywords, categories };
+    engine.consolidate();
+    return engine;
 }
 
-function getKeywordIndex(): KeywordIndex {
-    if (!_keywordIndex) _keywordIndex = buildKeywordIndex();
-    return _keywordIndex;
+function getBM25(): any {
+    if (!_bm25) _bm25 = buildBM25Index();
+    return _bm25;
 }
-
-// ─── SYNONYM MAP ──────────────────────────────────────────────────────────────
-// Ensures conceptually equivalent terms always cross-match
-
-const SYNONYMS: Record<string, string[]> = {
-    "auth": ["authentication", "login", "logout", "token", "oauth", "sso", "session", "2fa", "totp"],
-    "authentication": ["auth", "login", "logout", "token", "oauth", "sso", "session"],
-    "login": ["auth", "authentication", "signin", "sign"],
-    "logout": ["auth", "authentication", "signout"],
-    "message": ["messaging", "chat", "send", "post", "reply"],
-    "messaging": ["message", "chat", "send", "post", "reply"],
-    "channel": ["room", "group"],
-    "room": ["channel", "group"],
-    "user": ["member", "profile", "account"],
-    "notification": ["push", "alert", "subscribe"],
-    "integration": ["webhook", "trigger"],
-    "livechat": ["omnichannel", "visitor", "agent"],
-    "omnichannel": ["livechat", "visitor", "agent"],
-    "setting": ["config", "preference", "workspace"],
-    "statistic": ["statistics", "stats", "metrics"],
-    "statistics": ["statistic", "stats", "metrics"],
-};
 
 export function findCandidateApis(requirement: string): {
     candidates: ReturnType<typeof listAllApis>;
@@ -480,78 +292,63 @@ export function findCandidateApis(requirement: string): {
         totalInTag: number;
     }>;
 } {
-    const kwIndex = getKeywordIndex();
     const index = getIndex();
+    const allApis = listAllApis();
+    const bm25 = getBM25();
 
-    // Extract keywords from the requirement itself
-    const stopWords = new Set(["the", "a", "an", "to", "of", "in", "for",
-        "and", "or", "by", "i", "we", "my", "want", "need", "build",
-        "create", "make", "that", "this", "with", "from", "can", "will",
-        "should", "when", "then", "also", "just", "some", "have"]);
+    // BM25 search — returns [[operationId, score], ...]
+    const results = bm25.search(requirement, 20);
 
+    const candidates = results
+        .map((r: any) => allApis.find(a => a.operationId === r[0]))
+        .filter(Boolean) as ReturnType<typeof listAllApis>;
+
+    // Platform-agnostic subsystem penalty — re-rank to demote specialist subsystems
+    const totalCount = allApis.length;
+    const sourceFileCounts: Record<string, number> = {};
+    for (const api of allApis) {
+        sourceFileCounts[api.sourceFile] = (sourceFileCounts[api.sourceFile] || 0) + 1;
+    }
+
+    const reqLower = requirement.toLowerCase();
+    const penalized = candidates.filter(api => {
+        const fileCount = sourceFileCounts[api.sourceFile] || 0;
+        const isSpecialistSubsystem = (fileCount / totalCount) < 0.05;
+
+        if (isSpecialistSubsystem) {
+            const subsystemName = api.sourceFile
+                .replace(".yaml", "")
+                .replace(".json", "")
+                .toLowerCase();
+            return reqLower.includes(subsystemName);
+        }
+        return true;
+    });
+
+    // If penalty removed too many, keep original BM25 results
+    const finalCandidates = penalized.length >= 3 ? penalized : candidates;
+
+    // Extract matched keywords for coverage reporting
     const reqWords = requirement
         .toLowerCase()
         .replace(/[^a-z0-9\s]/g, " ")
         .split(/\s+/)
-        .filter(w => w.length > 3 && !stopWords.has(w));
+        .filter(w => w.length > 3);
 
-    // Expand with synonyms so e.g. "authentication" also searches "login", "token", etc.
-    const expandedWords = new Set(reqWords);
-    for (const word of reqWords) {
-        if (SYNONYMS[word]) {
-            for (const syn of SYNONYMS[word]) expandedWords.add(syn);
-        }
-        // Also check if any synonym key is a substring match
-        for (const [key, syns] of Object.entries(SYNONYMS)) {
-            if (word.includes(key) || key.includes(word)) {
-                for (const syn of syns) expandedWords.add(syn);
-                expandedWords.add(key);
-            }
-        }
-    }
+    const candidateText = finalCandidates
+        .map(c => `${c.operationId} ${c.summary} ${c.sourceFile}`)
+        .join(" ")
+        .toLowerCase();
 
-    // Score each API by how many requirement keywords it matches
-    const scores: Record<string, number> = {};
-
-    for (const word of expandedWords) {
-        // Exact keyword match
-        if (kwIndex.keywords[word]) {
-            for (const opId of kwIndex.keywords[word]) {
-                scores[opId] = (scores[opId] || 0) + 2; // exact match = 2 points
-            }
-        }
-
-        // Partial keyword match
-        for (const [indexed, opIds] of Object.entries(kwIndex.keywords)) {
-            if (indexed.includes(word) || word.includes(indexed)) {
-                for (const opId of opIds) {
-                    scores[opId] = (scores[opId] || 0) + 1; // partial = 1 point
-                }
-            }
-        }
-    }
-
-    // Sort by score, take top 20
-    const topIds = Object.entries(scores)
-        .sort(([, a], [, b]) => b - a)
-        .slice(0, 20)
-        .map(([id]) => id);
-
-    const allApis = listAllApis();
-    const candidates = allApis.filter(a => topIds.includes(a.operationId));
-
-    // Calculate what % of requirement keywords found matches
-    const matchedKeywords = [...expandedWords].filter(w =>
-        kwIndex.keywords[w] || Object.keys(kwIndex.keywords).some(k => k.includes(w))
-    );
+    const matchedKeywords = reqWords.filter(w => candidateText.includes(w));
 
     // Group candidates by tag for structured output
     const tagGroups: Record<string, {
-        endpoints: typeof candidates;
+        endpoints: typeof finalCandidates;
         totalInTag: number;
     }> = {};
 
-    for (const candidate of candidates) {
+    for (const candidate of finalCandidates) {
         const entry = (index as any)[candidate.operationId];
         const tags: string[] = entry?.tags?.length > 0
             ? entry.tags
@@ -559,15 +356,12 @@ export function findCandidateApis(requirement: string): {
 
         for (const tag of tags) {
             if (!tagGroups[tag]) {
-                // Count total endpoints in this tag across the full index
                 const totalInTag = Object.values(index).filter((e: any) =>
                     (e.tags?.length > 0 ? e.tags : [e.sourceFile.replace(".yaml", "")])
                         .includes(tag)
                 ).length;
-
                 tagGroups[tag] = { endpoints: [], totalInTag };
             }
-            // Avoid duplicates within a tag group
             if (!tagGroups[tag].endpoints.find(e => e.operationId === candidate.operationId)) {
                 tagGroups[tag].endpoints.push(candidate);
             }
@@ -575,7 +369,7 @@ export function findCandidateApis(requirement: string): {
     }
 
     return {
-        candidates,
+        candidates: finalCandidates,
         matchedKeywords,
         coverage: reqWords.length > 0
             ? Math.round((matchedKeywords.length / reqWords.length) * 100)
