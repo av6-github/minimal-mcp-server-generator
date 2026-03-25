@@ -45,6 +45,7 @@ When generating in workflow mode (after decompose_workflow):
 - If you know the correct RC API name for a step (e.g. chat.followMessage, chat.pinMessage),
   use it directly even if it's not in the candidates — generate_mcp_server resolves all names internally
 - Design the workflow from those candidates + your RC API knowledge immediately
+- **CRITICAL**: If a step must loop over multiple items (e.g., "all members", "each message"), you MUST specify `iterateOver` (array name from previous step), `filterBy` (input field), and `filterField` (item field). If you leave them null, the generated code will fail to loop!
 - Present it to the user and wait for confirmation
 - Do NOT loop back to list_rocketchat_apis, browse_apis_by_tag, or analyze_requirements
 - Do NOT call propose_mcp_server — that tool is Mode 1 only

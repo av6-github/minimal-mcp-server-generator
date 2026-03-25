@@ -11,7 +11,7 @@ function zodField(param: RCParameter): string {
     case "object": field = "z.record(z.string(), z.unknown())"; break;
     default: field = "z.string()";
   }
-  if (!param.required) field += ".optional()";
+
   // Escape quotes in description
   const desc = param.description
     .replace(/\r?\n/g, " ")   // flatten newlines
@@ -19,7 +19,11 @@ function zodField(param: RCParameter): string {
     .replace(/\s+/g, " ")      // collapse whitespace
     .trim()
     .slice(0, 120);             // cap length — descriptions don't need to be essays
+
   field += `.describe("${desc}")`;
+
+  if (!param.required) field += ".optional()";
+
   return field;
 }
 

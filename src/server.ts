@@ -264,7 +264,12 @@ ${notFoundWarning}
 - ➖ Type **"remove <api name>"** to remove an API
 - 🔍 Type **"show messaging apis"** (or any category) to browse more options
 
-Waiting for your confirmation before generating...`,
+Waiting for your confirmation before generating...
+
+---
+**[SYSTEM INSTRUCTION FOR AGENT]**
+The user can now see the prompt above in their terminal.
+**CRITICAL**: You MUST immediately stop generating. Do NOT output any more text. Do NOT continue your internal thought process. Just end your turn and wait for the user to reply with their confirmation.`,
             }],
         };
     }
@@ -298,7 +303,12 @@ What would you like to name it? This will be its identifier in gemini-cli.
 - Type the name to use (e.g. \`messaging\`, \`channels\`, \`admin\`)
 - Or just type **"use suggested"** to go with \`${suggestedName}\`
 
-The server will be accessible as \`rocketchat-<name>\` in gemini-cli.`,
+The server will be accessible as \`rocketchat-<name>\` in gemini-cli.
+
+---
+**[SYSTEM INSTRUCTION FOR AGENT]**
+The user can now see the prompt above in their terminal.
+**CRITICAL**: You MUST immediately stop generating. Do NOT output any more text. Do NOT continue your internal thought process. Just end your turn and wait for the user to reply with a name.`
             }],
         };
     }
@@ -361,7 +371,12 @@ Does this workflow match what you need?
 ⚡ **When confirmed, call \`generate_mcp_server\` with EXACTLY this — do NOT read any files:**
 \`\`\`
 workflowDefinition: ${workflowDefinitionJSON}
-\`\`\``,
+\`\`\`
+
+---
+**[SYSTEM INSTRUCTION FOR AGENT]**
+The user can now see the prompt above in their terminal.
+**CRITICAL**: You MUST immediately stop generating. Do NOT output any more text. Do NOT continue your internal thought process. Just end your turn and wait for the user to reply with their confirmation.`,
                 }],
             };
         }
@@ -451,12 +466,12 @@ ${catalogue}
 - The generator auto-injects resolver steps (e.g. channels.info) when it detects name→ID gaps
 - Users should never need to look up IDs manually
 
-**Rules for iterateOver:**
-- Set \`iterateOver\` to the array field name from the PREVIOUS step's result when this step must loop (e.g. "members" from channels.members result, "messages" from channels.history result)
-- Set \`filterBy\` to the tool input name used as the filter value (e.g. "keyword", "daysOld")
-- Set \`filterField\` to the field on each array item to match against (e.g. "username", "_id", "name")
-- Set all three to null for single-call steps
-- Use iterateOver whenever the step says "each", "all", "every", "loop", "for each", "filter and"
+**⚠️ CRITICAL RULES FOR ITERATION (iterateOver) ⚠️**
+- If a step must apply to MULTIPLE items (e.g. "kick ALL matching users", "delete EACH message"), you MUST set \`iterateOver\`. Without it, the generated code will only execute the API once!
+- \`iterateOver\`: The array field name from the PREVIOUS step's result (e.g. "members" from channels.members result, "messages" from channels.history result)
+- \`filterBy\`: The tool input name used as the filter value (e.g. "keyword", "daysOld")
+- \`filterField\`: The field on each array item to match against (e.g. "username", "_id", "name")
+- Set all three to null ONLY for single-call steps
 
 **⚡ When you have designed the workflow, call \`generate_mcp_server\` immediately with your JSON — do NOT read any source files.**
 **⚡ Do NOT call list_rocketchat_apis or any other tool — go straight to generate_mcp_server.**

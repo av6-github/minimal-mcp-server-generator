@@ -305,8 +305,8 @@ export function generateWorkflowToolCode(tool: WorkflowTool): string {
                 : i.type === "boolean" ? "z.boolean()"
                     : i.type === "array" ? "z.array(z.string())"
                         : "z.string()";
-            if (!i.required) field += ".optional()";
             field += `.describe("${i.description.replace(/"/g, '\\"')}")`;
+            if (!i.required) field += ".optional()";
             return `    ${i.name}: ${field}`;
         })
         .join(",\n");
